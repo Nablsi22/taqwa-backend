@@ -9,7 +9,8 @@ RUN npm ci --include=dev
 
 COPY . .
 RUN npx prisma generate
-RUN npm run build
+RUN npx tsc -p tsconfig.build.json
+RUN ls -la dist/ && test -f dist/main.js || (echo "BUILD FAILED: dist/main.js not found" && exit 1)
 
 EXPOSE 3000
 
