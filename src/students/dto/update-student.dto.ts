@@ -36,4 +36,11 @@ export class UpdateStudentDto {
   @IsOptional()
   @IsString()
   grade?: string;
+
+
+  @IsOptional()
+  @IsString()
+  password?: string;
+  
+
   }

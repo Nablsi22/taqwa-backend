@@ -14,6 +14,7 @@ import { GiftsModule } from './gifts/gifts.module';
 import { PointRulesModule } from './point-rules/point-rules.module';
 import { RecitationModule } from './recitation/recitation.module';
 import { NotificationModule } from './notification/notification.module';
+import { InstructorAttendanceModule } from './instructor-attendance/instructor-attendance.module';
 
 
 @Module({
@@ -37,6 +38,7 @@ import { NotificationModule } from './notification/notification.module';
     PointRulesModule,
     RecitationModule,
     NotificationModule ,
+    InstructorAttendanceModule,
   ],
   providers: [
     {

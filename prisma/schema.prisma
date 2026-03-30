@@ -194,10 +194,9 @@ model InstructorAttendance {
   instructorId String     @map("instructor_id")
   date         DateTime   @db.Date
   present      Boolean    @default(true)
-  createdAt    DateTime   @default(now()) @map("created_at")
-
+  notes        String?
+  createdAt    DateTime   @default(now())
   instructor   Instructor @relation(fields: [instructorId], references: [id])
-
   @@unique([instructorId, date])
   @@map("instructor_attendance")
 }

@@ -19,38 +19,30 @@ import { Roles } from '../auth/decorators/roles.decorator';
 export class PointRulesController {
   constructor(private readonly pointRulesService: PointRulesService) {}
 
-  /** GET all rules */
   @Get()
   @Roles('ADMIN', 'INSTRUCTOR')
   findAll() {
     return this.pointRulesService.findAll();
   }
 
-  /** GET manual rules only (for instructor quick-apply) */
   @Get('manual')
   @Roles('ADMIN', 'INSTRUCTOR')
   getManualRules() {
     return this.pointRulesService.getManualRules();
   }
 
-  /** PUT update point value only */
   @Put(':id')
   @Roles('ADMIN')
-  updatePoints(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() body: { points: number },
-  ) {
-    return this.pointRulesService.updatePoints(id, body.points);
+  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) {
+    return this.pointRulesService.updatePoints(id, dto.points);
   }
 
-  /** POST add a new manual rule */
   @Post()
   @Roles('ADMIN')
-  createManualRule(@Body() body: { nameAr: string; points: number; description?: string }) {
-    return this.pointRulesService.createManualRule(body);
+  create(@Body() dto: any) {
+    return this.pointRulesService.createManualRule(dto);
   }
 
-  /** DELETE a custom rule (only deletable ones) */
   @Delete(':id')
   @Roles('ADMIN')
   remove(@Param('id', ParseUUIDPipe) id: string) {

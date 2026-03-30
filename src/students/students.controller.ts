@@ -26,7 +26,7 @@ export class StudentsController {
   @Post()
   @Roles('ADMIN', 'INSTRUCTOR')
   create(@Body() dto: CreateStudentDto, @Request() req: any) {
-    return this.studentsService.create(dto, req.user.sub);
+    return this.studentsService.create(dto, req.user.id);
   }
 
   @Get()
@@ -64,6 +64,16 @@ export class StudentsController {
     @Body() dto: UpdateStudentDto,
   ) {
     return this.studentsService.update(id, dto);
+  }
+
+  // POST /api/v1/students/:id/reset-password
+  @Post(':id/reset-password')
+  @Roles('ADMIN')
+  resetPassword(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body('password') password: string,
+  ) {
+    return this.studentsService.resetPassword(id, password);
   }
 
   @Delete(':id')

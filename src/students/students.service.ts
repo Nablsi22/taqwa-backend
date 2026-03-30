@@ -22,7 +22,8 @@ export class StudentsService {
     }
 
     // Create a User account for the student
-    const username = dto.username || dto.fullName.replace(/\s+/g, '.').toLowerCase();
+    const username =
+      dto.username || dto.fullName.replace(/\s+/g, '.').toLowerCase();
     const password = dto.password || 'Taqwa@2026';
     const passwordHash = await bcrypt.hash(password, 12);
 
@@ -88,6 +89,7 @@ export class StudentsService {
         take: limit,
         orderBy: { fullName: 'asc' },
         include: {
+          user: { select: { username: true } },
           instructor: {
             include: { user: { select: { username: true } } },
           },
@@ -126,6 +128,7 @@ export class StudentsService {
     const student = await this.prisma.student.findUnique({
       where: { id },
       include: {
+        user: { select: { username: true } },
         instructor: {
           include: { user: { select: { username: true } } },
         },
@@ -157,7 +160,13 @@ export class StudentsService {
   }
 
   async update(id: string, dto: UpdateStudentDto) {
-    await this.findOne(id);
+    const exists = await this.prisma.student.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!exists) {
+      throw new NotFoundException('الطالب غير موجود');
+    }
 
     if (dto.instructorId) {
       const instructor = await this.prisma.instructor.findUnique({
@@ -165,6 +174,21 @@ export class StudentsService {
       });
       if (!instructor) {
         throw new BadRequestException('المعلم غير موجود');
+      }
+    }
+
+    // Handle password reset
+    if (dto.password) {
+      const student = await this.prisma.student.findUnique({
+        where: { id },
+        select: { userId: true },
+      });
+      if (student) {
+        const passwordHash = await bcrypt.hash(dto.password, 12);
+        await this.prisma.user.update({
+          where: { id: student.userId },
+          data: { passwordHash },
+        });
       }
     }
 
@@ -188,7 +212,21 @@ export class StudentsService {
       },
     });
   }
-
+async resetPassword(id: string, password: string) {
+    const student = await this.prisma.student.findUnique({
+      where: { id },
+      select: { userId: true, fullName: true },
+    });
+    if (!student) {
+      throw new NotFoundException('الطالب غير موجود');
+    }
+    const passwordHash = await bcrypt.hash(password, 12);
+    await this.prisma.user.update({
+      where: { id: student.userId },
+      data: { passwordHash },
+    });
+    return { message: 'تم تغيير كلمة المرور بنجاح' };
+  }
   async remove(id: string) {
     await this.findOne(id);
     // Soft delete
