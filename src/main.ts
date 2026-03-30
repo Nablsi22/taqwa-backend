@@ -26,7 +26,7 @@ async function bootstrap() {
   );
 
   // Listen on all interfaces so mobile devices can connect
-  await app.listen(3000, '0.0.0.0');
+  await app.listen(process.env.PORT || 3000, '0.0.0.0');
   console.log('Taqwa API running on http://0.0.0.0:3000');
 }
 bootstrap();
