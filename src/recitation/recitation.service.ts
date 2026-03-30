@@ -61,6 +61,7 @@ export class RecitationService {
       },
     });
 
+    // ── AUTO-POINTS: Apply points based on rating ──
     await this.applyRecitationPoints(
       dto.studentId,
       instructorId,
@@ -102,6 +103,7 @@ export class RecitationService {
         },
       });
 
+      // ── FIX: MAQRAA now gets points too ──
       await this.applyRecitationPoints(
         studentId,
         instructorId,
@@ -121,48 +123,84 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // POINTS — Auto-apply based on rating
+  // POINTS — Auto-apply based on rating (FIXED)
   // ═══════════════════════════════════════════════════════════
 
+  /**
+   * FIXES applied:
+   * 1. MAQRAA no longer returns early — uses RECITE_MAQRAA rule
+   * 2. Category lookup uses flexible matching instead of exact 'recitation'
+   * 3. Points check uses !== 0 instead of > 0 (supports deductions)
+   * 4. Added try-catch so points errors don't break recitation creation
+   */
   private async applyRecitationPoints(
     studentId: string,
     instructorId: string,
     rating: string,
     pageCount: number,
   ) {
-    if (rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE' || pageCount <= 0) {
-      return;
-    }
-
-    if (rating === 'MAQRAA') {
-      return;
-    }
-
-    const pointResult = await this.pointRulesService.getRecitationPoints(
-      rating,
-      pageCount,
-    );
-
-    if (pointResult && pointResult.points > 0) {
-      let category = await this.prisma.pointCategory.findFirst({
-        where: { name: 'recitation' },
-      });
-      if (!category) {
-        category = await this.prisma.pointCategory.findFirst();
+    try {
+      // Skip only ratings that should never earn points
+      if (rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE' || pageCount <= 0) {
+        return;
       }
 
-      if (category) {
-        await this.prisma.pointsLog.create({
-          data: {
-            studentId,
-            categoryId: category.id,
-            amount: Math.round(pointResult.points),
-            rating: rating as any,
-            description: pointResult.ruleNameAr,
-            awardedBy: instructorId,
-          },
+      let pointResult: { points: number; ruleNameAr: string } | null = null;
+
+      if (rating === 'MAQRAA') {
+        // ── FIX: MAQRAA now gets its own rule points ──
+        const maqraaRule = await this.pointRulesService.findByCode('RECITE_MAQRAA');
+        if (maqraaRule && maqraaRule.isActive) {
+          const pts = maqraaRule.isPerPage
+            ? maqraaRule.points * pageCount
+            : maqraaRule.points;
+          pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
+        }
+      } else {
+        // GOOD / VERY_GOOD — use the rules service
+        pointResult = await this.pointRulesService.getRecitationPoints(
+          rating,
+          pageCount,
+        );
+      }
+
+      // ── FIX: Check !== 0 instead of > 0 to support deductions ──
+      if (pointResult && pointResult.points !== 0) {
+        // ── FIX: Robust category lookup — try multiple patterns ──
+        let category = await this.prisma.pointCategory.findFirst({
+          where: { name: { contains: 'Quran', mode: 'insensitive' } },
         });
+        if (!category) {
+          category = await this.prisma.pointCategory.findFirst({
+            where: { name: { contains: 'recitation', mode: 'insensitive' } },
+          });
+        }
+        if (!category) {
+          category = await this.prisma.pointCategory.findFirst({
+            where: { name: { contains: 'Memorization', mode: 'insensitive' } },
+          });
+        }
+        if (!category) {
+          // Last resort: use the first available category
+          category = await this.prisma.pointCategory.findFirst();
+        }
+
+        if (category) {
+          await this.prisma.pointsLog.create({
+            data: {
+              studentId,
+              categoryId: category.id,
+              amount: Math.round(pointResult.points),
+              rating: rating as any,
+              description: pointResult.ruleNameAr,
+              awardedBy: instructorId,
+            },
+          });
+        }
       }
+    } catch (error) {
+      // Log the error but don't fail the recitation creation
+      console.error('Error applying recitation points:', error);
     }
   }
 
@@ -170,21 +208,12 @@ export class RecitationService {
   // STUDENT PROGRESS — Cumulative sura tracking (FIXED)
   // ═══════════════════════════════════════════════════════════
 
-  /**
-   * Get a student's complete memorization progress across all suras.
-   * Returns per-sura progress and overall percentage.
-   *
-   * FIX: isCompleteSura entries now correctly count their pages
-   *      toward the total. Previously, the if/else chain skipped
-   *      page accumulation when isCompleteSura was true, causing 0%.
-   */
   async getStudentProgress(studentId: string) {
     const recitations = await this.prisma.recitation.findMany({
       where: { studentId },
       orderBy: { date: 'asc' },
     });
 
-    // Build per-sura progress
     const suraProgressMap = new Map<
       number,
       {
@@ -207,35 +236,23 @@ export class RecitationService {
 
       const progress = suraProgressMap.get(rec.surahNumber)!;
 
-      // ── FIX: Count pages for ALL memorization-type entries ──
       if (rec.isCompleteSura) {
-        // Complete sura: mark complete AND count pages
         progress.isComplete = true;
         progress.individualPages += rec.pagesRecited;
       } else if (rec.rating === 'VERY_GOOD' || rec.rating === 'GOOD') {
-        // Normal recitation: accumulate pages
         progress.individualPages += rec.pagesRecited;
       }
-      // MAQRAA, REPEAT, DID_NOT_MEMORIZE → no page credit
 
-      // Always update last date/rating
       progress.lastDate = rec.date;
       progress.lastRating = rec.rating;
     }
 
-    // Build the full 114-sura response
     const suraProgress = SURA_METADATA.map((sura) => {
       const progress = suraProgressMap.get(sura.number);
       const individualPages = progress?.individualPages || 0;
-
-      // Cap at sura's total pages (can't memorize more than 100%)
       const cappedPages = Math.min(individualPages, sura.totalPages);
-
-      // Auto-complete: if accumulated pages >= sura total
       const isComplete =
         progress?.isComplete || individualPages >= sura.totalPages;
-
-      // Sura completion percentage (capped at 100%)
       const percentage = Math.min(
         100,
         Math.round((cappedPages / sura.totalPages) * 100),
@@ -255,7 +272,6 @@ export class RecitationService {
       };
     });
 
-    // Overall Quran progress — sum of capped per-sura pages
     const totalPagesMemorized = suraProgress.reduce(
       (sum, s) => sum + s.individualPagesMemorized,
       0,
@@ -342,9 +358,6 @@ export class RecitationService {
         orderBy: { date: 'desc' },
       });
 
-      // ── FIX: Use per-sura capped sum instead of raw aggregate ──
-      // This prevents over-counting when a student recites the same
-      // sura multiple times beyond its total pages.
       const recitations = await this.prisma.recitation.findMany({
         where: {
           studentId: student.id,
@@ -353,7 +366,6 @@ export class RecitationService {
         select: { surahNumber: true, pagesRecited: true, isCompleteSura: true },
       });
 
-      // Group by sura and cap at each sura's total pages
       const suraPages = new Map<number, number>();
       for (const rec of recitations) {
         const current = suraPages.get(rec.surahNumber) || 0;

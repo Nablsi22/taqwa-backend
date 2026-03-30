@@ -17,7 +17,7 @@ export class PointRulesService {
   }
 
   /**
-   * Get a single rule by code (used internally)
+   * Get a single rule by code (used internally by other services)
    */
   async findByCode(code: string) {
     return this.prisma.pointRule.findUnique({ where: { code } });
@@ -98,11 +98,27 @@ export class PointRulesService {
   }
 
   /**
-   * Calculate points for recitation
-   * Handles: GOOD (+1/page), VERY_GOOD (+2/page), 5+ pages (+3/page override)
+   * Calculate points for recitation (FIXED)
+   *
+   * FIX 1: Corrected DID_NOT_MEMORIZE check (was NO_MEMORIZATION)
+   * FIX 2: Added MAQRAA handling via RECITE_MAQRAA rule
+   * Handles: GOOD (+1/page), VERY_GOOD (+2/page), 5+ pages (+3/page override), MAQRAA (+1/page)
    */
   async getRecitationPoints(rating: string, pageCount: number): Promise<{ points: number; ruleNameAr: string } | null> {
-    if (!rating || rating === 'REPEAT' || rating === 'NO_MEMORIZATION' || pageCount <= 0) {
+    // ── FIX: Corrected enum value from NO_MEMORIZATION to DID_NOT_MEMORIZE ──
+    if (!rating || rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE' || pageCount <= 0) {
+      return null;
+    }
+
+    // ── FIX: Handle MAQRAA rating ──
+    if (rating === 'MAQRAA') {
+      const maqraaRule = await this.findByCode('RECITE_MAQRAA');
+      if (maqraaRule && maqraaRule.isActive) {
+        const pts = maqraaRule.isPerPage
+          ? maqraaRule.points * pageCount
+          : maqraaRule.points;
+        return { points: pts, ruleNameAr: maqraaRule.nameAr };
+      }
       return null;
     }
 
