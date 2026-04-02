@@ -10,6 +10,7 @@
     "dist",
     "**/*spec.ts",
     "seed-instructor.ts",
-    "seed*.ts"
+    "seed*.ts",
+    "prisma/**/*.ts"
   ]
 }
