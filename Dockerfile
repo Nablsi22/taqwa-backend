@@ -9,9 +9,9 @@ RUN npm ci --include=dev
 
 COPY . .
 RUN npx prisma generate
-RUN rm -rf dist
-RUN npx tsc -p tsconfig.build.json
-RUN ls dist/main.js || (echo "BUILD CHECK: main.js not at dist/" && ls dist/ && exit 1)
+RUN rm -rf dist tsconfig.build.tsbuildinfo
+RUN npm run build
+RUN ls -la dist/
 
 EXPOSE 3000
 
