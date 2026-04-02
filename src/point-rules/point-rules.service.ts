@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -27,26 +31,45 @@ export class PointRulesService {
    * Update ONLY the point value of a rule (admin action)
    */
   async updatePoints(id: string, points: number) {
+    // ── FIX: Validate points is a real number before touching Prisma ──
+    const numPoints = Number(points);
+    if (points === undefined || points === null || isNaN(numPoints)) {
+      throw new BadRequestException(
+        'يرجى إرسال قيمة النقاط (points) كعدد صحيح',
+      );
+    }
+
     const rule = await this.prisma.pointRule.findUnique({ where: { id } });
     if (!rule) throw new NotFoundException('القاعدة غير موجودة');
 
-    // Preserve sign: earn rules must be positive, deduct must be negative
+    // Preserve sign: earn rules stay positive, deduct rules stay negative
     const isDeduct = rule.points < 0;
-    const absPoints = Math.abs(points);
+    const absPoints = Math.abs(numPoints);
     const finalPoints = isDeduct ? -absPoints : absPoints;
 
-    const updated = await this.prisma.pointRule.update({
-      where: { id },
-      data: { points: finalPoints },
-    });
+    try {
+      const updated = await this.prisma.pointRule.update({
+        where: { id },
+        data: { points: finalPoints },
+      });
 
-    return { message: 'تم تحديث النقاط بنجاح', data: updated };
+      return { message: 'تم تحديث النقاط بنجاح', data: updated };
+    } catch (error) {
+      console.error('updatePoints Prisma error:', error);
+      throw new BadRequestException(
+        `فشل تحديث القاعدة: ${error.message || error}`,
+      );
+    }
   }
 
   /**
    * Admin adds a new manual rule
    */
-  async createManualRule(dto: { nameAr: string; points: number; description?: string }) {
+  async createManualRule(dto: {
+    nameAr: string;
+    points: number;
+    description?: string;
+  }) {
     const code = 'CUSTOM_' + Date.now();
 
     const rule = await this.prisma.pointRule.create({
@@ -84,7 +107,9 @@ export class PointRulesService {
   /**
    * Calculate points for attendance status
    */
-  async getAttendancePoints(status: 'PRESENT' | 'LATE' | 'ABSENT'): Promise<{ points: number; ruleNameAr: string } | null> {
+  async getAttendancePoints(
+    status: 'PRESENT' | 'LATE' | 'ABSENT',
+  ): Promise<{ points: number; ruleNameAr: string } | null> {
     const codeMap: Record<string, string> = {
       PRESENT: 'ATTEND_ON_TIME',
       LATE: 'LATE',
@@ -98,19 +123,22 @@ export class PointRulesService {
   }
 
   /**
-   * Calculate points for recitation (FIXED)
-   *
-   * FIX 1: Corrected DID_NOT_MEMORIZE check (was NO_MEMORIZATION)
-   * FIX 2: Added MAQRAA handling via RECITE_MAQRAA rule
-   * Handles: GOOD (+1/page), VERY_GOOD (+2/page), 5+ pages (+3/page override), MAQRAA (+1/page)
+   * Calculate points for recitation
    */
-  async getRecitationPoints(rating: string, pageCount: number): Promise<{ points: number; ruleNameAr: string } | null> {
-    // ── FIX: Corrected enum value from NO_MEMORIZATION to DID_NOT_MEMORIZE ──
-    if (!rating || rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE' || pageCount <= 0) {
+  async getRecitationPoints(
+    rating: string,
+    pageCount: number,
+  ): Promise<{ points: number; ruleNameAr: string } | null> {
+    if (
+      !rating ||
+      rating === 'REPEAT' ||
+      rating === 'DID_NOT_MEMORIZE' ||
+      pageCount <= 0
+    ) {
       return null;
     }
 
-    // ── FIX: Handle MAQRAA rating ──
+    // Handle MAQRAA rating
     if (rating === 'MAQRAA') {
       const maqraaRule = await this.findByCode('RECITE_MAQRAA');
       if (maqraaRule && maqraaRule.isActive) {
@@ -122,10 +150,15 @@ export class PointRulesService {
       return null;
     }
 
-    // Check 5+ pages bonus first (applies to both GOOD and VERY_GOOD)
+    // Check 5+ pages bonus first
     if (pageCount >= 5) {
       const bonusRule = await this.findByCode('RECITE_5PLUS_PAGES');
-      if (bonusRule && bonusRule.isActive && bonusRule.minPages && pageCount >= bonusRule.minPages) {
+      if (
+        bonusRule &&
+        bonusRule.isActive &&
+        bonusRule.minPages &&
+        pageCount >= bonusRule.minPages
+      ) {
         return {
           points: bonusRule.points * pageCount,
           ruleNameAr: bonusRule.nameAr,

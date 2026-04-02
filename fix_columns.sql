@@ -1,0 +1,2 @@
+ALTER TABLE instructor_attendance ADD COLUMN IF NOT EXISTS notes TEXT;
+ALTER TABLE instructor_attendance ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();

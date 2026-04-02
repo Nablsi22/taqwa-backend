@@ -71,9 +71,10 @@ export class PointsService {
     });
 
     return {
-      message: amount >= 0
-        ? `تم إضافة ${amount} نقطة للطالب ${log.student.fullName}`
-        : `تم خصم ${Math.abs(amount)} نقطة من الطالب ${log.student.fullName}`,
+      message:
+        amount >= 0
+          ? `تم إضافة ${amount} نقطة للطالب ${log.student.fullName}`
+          : `تم خصم ${Math.abs(amount)} نقطة من الطالب ${log.student.fullName}`,
       data: {
         id: log.id,
         studentName: log.student.fullName,
@@ -204,22 +205,60 @@ export class PointsService {
 
     return { message: 'تم حذف سجل النقاط بنجاح' };
   }
-  async updateCategory(id: string, data: { defaultValue?: number; nameAr?: string; isActive?: boolean; hasRating?: boolean }) {
-    const category = await this.prisma.pointCategory.findUnique({ where: { id } });
+
+  /**
+   * Update a point category (admin only)
+   */
+  async updateCategory(
+    id: string,
+    data: {
+      defaultValue?: number;
+      nameAr?: string;
+      isActive?: boolean;
+      hasRating?: boolean;
+    },
+  ) {
+    const category = await this.prisma.pointCategory.findUnique({
+      where: { id },
+    });
     if (!category) {
       throw new NotFoundException('الفئة غير موجودة');
     }
 
-    const updated = await this.prisma.pointCategory.update({
-      where: { id },
-      data: {
-        ...(data.defaultValue !== undefined && { defaultValue: data.defaultValue }),
-        ...(data.nameAr !== undefined && { nameAr: data.nameAr }),
-        ...(data.isActive !== undefined && { isActive: data.isActive }),
-        ...(data.hasRating !== undefined && { hasRating: data.hasRating }),
-      },
-    });
+    // Build update payload with explicit type safety
+    const updateData: Record<string, any> = {};
 
-    return { message: 'تم تحديث الفئة بنجاح', data: updated };
+    if (data.defaultValue !== undefined) {
+      const numVal = Number(data.defaultValue);
+      if (isNaN(numVal) || !Number.isInteger(numVal)) {
+        throw new BadRequestException(
+          'القيمة الافتراضية يجب أن تكون عدد صحيح',
+        );
+      }
+      updateData.defaultValue = numVal;
+    }
+    if (data.nameAr !== undefined) {
+      updateData.nameAr = String(data.nameAr);
+    }
+    if (data.isActive !== undefined) {
+      updateData.isActive = Boolean(data.isActive);
+    }
+    if (data.hasRating !== undefined) {
+      updateData.hasRating = Boolean(data.hasRating);
+    }
+
+    try {
+      const updated = await this.prisma.pointCategory.update({
+        where: { id },
+        data: updateData,
+      });
+
+      return { message: 'تم تحديث الفئة بنجاح', data: updated };
+    } catch (error) {
+      console.error('updateCategory Prisma error:', error);
+      throw new BadRequestException(
+        `فشل تحديث الفئة: ${error.message || error}`,
+      );
+    }
   }
 }

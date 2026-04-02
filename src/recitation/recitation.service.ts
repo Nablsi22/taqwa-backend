@@ -61,7 +61,7 @@ export class RecitationService {
       },
     });
 
-    // ── AUTO-POINTS: Apply points based on rating ──
+    // —— AUTO-POINTS: Apply points based on rating ——
     await this.applyRecitationPoints(
       dto.studentId,
       instructorId,
@@ -103,7 +103,7 @@ export class RecitationService {
         },
       });
 
-      // ── FIX: MAQRAA now gets points too ──
+      // —— FIX: MAQRAA now gets points too ——
       await this.applyRecitationPoints(
         studentId,
         instructorId,
@@ -126,13 +126,6 @@ export class RecitationService {
   // POINTS — Auto-apply based on rating (FIXED)
   // ═══════════════════════════════════════════════════════════
 
-  /**
-   * FIXES applied:
-   * 1. MAQRAA no longer returns early — uses RECITE_MAQRAA rule
-   * 2. Category lookup uses flexible matching instead of exact 'recitation'
-   * 3. Points check uses !== 0 instead of > 0 (supports deductions)
-   * 4. Added try-catch so points errors don't break recitation creation
-   */
   private async applyRecitationPoints(
     studentId: string,
     instructorId: string,
@@ -140,7 +133,6 @@ export class RecitationService {
     pageCount: number,
   ) {
     try {
-      // Skip only ratings that should never earn points
       if (rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE' || pageCount <= 0) {
         return;
       }
@@ -148,7 +140,6 @@ export class RecitationService {
       let pointResult: { points: number; ruleNameAr: string } | null = null;
 
       if (rating === 'MAQRAA') {
-        // ── FIX: MAQRAA now gets its own rule points ──
         const maqraaRule = await this.pointRulesService.findByCode('RECITE_MAQRAA');
         if (maqraaRule && maqraaRule.isActive) {
           const pts = maqraaRule.isPerPage
@@ -157,16 +148,13 @@ export class RecitationService {
           pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
         }
       } else {
-        // GOOD / VERY_GOOD — use the rules service
         pointResult = await this.pointRulesService.getRecitationPoints(
           rating,
           pageCount,
         );
       }
 
-      // ── FIX: Check !== 0 instead of > 0 to support deductions ──
       if (pointResult && pointResult.points !== 0) {
-        // ── FIX: Robust category lookup — try multiple patterns ──
         let category = await this.prisma.pointCategory.findFirst({
           where: { name: { contains: 'Quran', mode: 'insensitive' } },
         });
@@ -181,7 +169,6 @@ export class RecitationService {
           });
         }
         if (!category) {
-          // Last resort: use the first available category
           category = await this.prisma.pointCategory.findFirst();
         }
 
@@ -199,7 +186,6 @@ export class RecitationService {
         }
       }
     } catch (error) {
-      // Log the error but don't fail the recitation creation
       console.error('Error applying recitation points:', error);
     }
   }
@@ -411,5 +397,25 @@ export class RecitationService {
         juz: s.juzStart,
       })),
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // DELETE RECITATION — Admin only
+  // ═══════════════════════════════════════════════════════════
+
+  async deleteRecitation(id: string) {
+    const recitation = await this.prisma.recitation.findUnique({
+      where: { id },
+    });
+
+    if (!recitation) {
+      throw new NotFoundException('سجل التسميع غير موجود');
+    }
+
+    await this.prisma.recitation.delete({
+      where: { id },
+    });
+
+    return { message: 'تم حذف سجل التسميع بنجاح' };
   }
 }
