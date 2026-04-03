@@ -15,4 +15,4 @@ RUN ls -la dist/
 
 EXPOSE 3000
 
-CMD ["node", "dist/main.js"]
+CMD npx prisma migrate deploy && node prisma/seed_admin.js && node prisma/seed-rules.js && node dist/main.js
