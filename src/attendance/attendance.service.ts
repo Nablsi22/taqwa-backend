@@ -18,17 +18,51 @@ export class AttendanceService {
     const date = new Date(dto.date);
     const results: any[] = [];
 
+    // Look up dedicated attendance categories first; fall back to generic
+    // EARN/DEDUCT categories only if no attendance-specific ones exist.
     let earnCategoryId: string | null = null;
     let deductCategoryId: string | null = null;
     try {
-      const earnCat = await this.prisma.pointCategory.findFirst({
-        where: { type: 'EARN', isActive: true },
+      // Prefer a category whose name mentions حضور / attendance
+      const attendanceEarn = await this.prisma.pointCategory.findFirst({
+        where: {
+          type: 'EARN',
+          isActive: true,
+          OR: [
+            { nameAr: { contains: 'حضور' } },
+            { nameAr: { contains: 'الحضور' } },
+            { name: { contains: 'attendance', mode: 'insensitive' } },
+          ],
+        },
       });
-      const deductCat = await this.prisma.pointCategory.findFirst({
-        where: { type: 'DEDUCT', isActive: true },
+      const attendanceDeduct = await this.prisma.pointCategory.findFirst({
+        where: {
+          type: 'DEDUCT',
+          isActive: true,
+          OR: [
+            { nameAr: { contains: 'غياب' } },
+            { nameAr: { contains: 'تأخير' } },
+            { name: { contains: 'attendance', mode: 'insensitive' } },
+            { name: { contains: 'absent', mode: 'insensitive' } },
+          ],
+        },
       });
-      earnCategoryId = earnCat?.id || null;
-      deductCategoryId = deductCat?.id || null;
+
+      // Fall back to first generic EARN/DEDUCT if no attendance-specific
+      // category exists yet.
+      const fallbackEarn = attendanceEarn
+        ? null
+        : await this.prisma.pointCategory.findFirst({
+            where: { type: 'EARN', isActive: true },
+          });
+      const fallbackDeduct = attendanceDeduct
+        ? null
+        : await this.prisma.pointCategory.findFirst({
+            where: { type: 'DEDUCT', isActive: true },
+          });
+
+      earnCategoryId = (attendanceEarn ?? fallbackEarn)?.id || null;
+      deductCategoryId = (attendanceDeduct ?? fallbackDeduct)?.id || null;
     } catch (_) {}
 
     for (const entry of dto.entries) {
