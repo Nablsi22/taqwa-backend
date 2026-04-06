@@ -67,6 +67,8 @@ model Student {
   createdAt    DateTime  @default(now()) @map("created_at")
   updatedAt    DateTime  @updatedAt @map("updated_at")
   deletedAt    DateTime? @map("deleted_at")
+  credentialsSentAt   DateTime?   @map("credentials_sent_at")     // NEW
+  lastCredentialReset DateTime?   @map("last_credential_reset")   // NEW
 
   user        User         @relation(fields: [userId], references: [id])
   instructor  Instructor   @relation(fields: [instructorId], references: [id])

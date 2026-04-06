@@ -8,12 +8,19 @@ import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
 import { Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import {
+  generateCredentials,
+  generateNewPassword,
+  generatePassword,
+  hashPassword,
+} from './credentials.util';
 
 @Injectable()
 export class StudentsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async create(dto: CreateStudentDto, createdByUserId: string) {
+    // Verify instructor exists
     const instructor = await this.prisma.instructor.findUnique({
       where: { id: dto.instructorId },
     });
@@ -21,10 +28,13 @@ export class StudentsService {
       throw new BadRequestException('المعلم غير موجود');
     }
 
-    const username =
-      dto.username || dto.fullName.replace(/\s+/g, '.').toLowerCase();
-    const password = dto.password || 'Taqwa@2026';
-    const passwordHash = await bcrypt.hash(password, 12);
+    const dob = new Date(dto.dateOfBirth);
+
+    // Auto-generate username (YYYYNNNN) and a strong random password.
+    // The plain password is returned to the caller ONCE so the admin
+    // can distribute it; it is never stored anywhere except as a bcrypt hash.
+    const { username, plainPassword, passwordHash } =
+      await generateCredentials(this.prisma, dob);
 
     const user = await this.prisma.user.create({
       data: {
@@ -35,12 +45,12 @@ export class StudentsService {
       },
     });
 
-    return this.prisma.student.create({
+    const student = await this.prisma.student.create({
       data: {
         userId: user.id,
         fullName: dto.fullName,
         fatherName: dto.fatherName,
-        dateOfBirth: new Date(dto.dateOfBirth),
+        dateOfBirth: dob,
         instructorId: dto.instructorId,
         school: dto.school,
         address: dto.address,
@@ -55,6 +65,17 @@ export class StudentsService {
         _count: { select: { attendance: true, pointsLog: true } },
       },
     });
+
+    // ⚠️ The plain password is returned ONCE in this response.
+    // The Flutter app must show it to the admin immediately and never
+    // request it again — there's no endpoint to retrieve it later.
+    return {
+      ...student,
+      generatedCredentials: {
+        username,
+        password: plainPassword,
+      },
+    };
   }
 
   async findAll(params?: {
@@ -246,7 +267,9 @@ export class StudentsService {
     });
   }
 
-  async resetPassword(id: string, password: string) {
+  async resetPassword(id: string, _ignoredManualPassword?: string) {
+    // Note: the second parameter used to be a manually-provided password.
+    // We now ignore it and always generate a strong random one for security.
     const student = await this.prisma.student.findUnique({
       where: { id },
       select: { userId: true, fullName: true },
@@ -254,12 +277,26 @@ export class StudentsService {
     if (!student) {
       throw new NotFoundException('الطالب غير موجود');
     }
-    const passwordHash = await bcrypt.hash(password, 12);
-    await this.prisma.user.update({
-      where: { id: student.userId },
-      data: { passwordHash },
-    });
-    return { message: 'تم تغيير كلمة المرور بنجاح' };
+
+    const { plainPassword, passwordHash } = await generateNewPassword();
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: student.userId },
+        data: { passwordHash },
+      }),
+      this.prisma.student.update({
+        where: { id },
+        data: { lastCredentialReset: new Date() },
+      }),
+    ]);
+
+    // Plain password returned ONCE — same security model as create().
+    return {
+      message: 'تم إنشاء كلمة مرور جديدة',
+      newPassword: plainPassword,
+      studentName: student.fullName,
+    };
   }
 
   async remove(id: string) {
@@ -291,6 +328,182 @@ export class StudentsService {
       totalPoints: student.totalPoints,
       attendance: attendanceCount,
       pointsByCategory,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // CREDENTIALS MANAGEMENT — admin-only
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * List every student with credential metadata for the admin
+   * credentials screen. Does NOT return passwords (we don't have them).
+   */
+  async listCredentials(params?: {
+    search?: string;
+    sentFilter?: 'all' | 'sent' | 'unsent';
+  }) {
+    const { search, sentFilter = 'all' } = params || {};
+
+    const where: any = { deletedAt: null };
+
+    if (search) {
+      where.OR = [
+        { fullName: { contains: search, mode: 'insensitive' } },
+        { phone1: { contains: search } },
+        { phone2: { contains: search } },
+        { user: { username: { contains: search } } },
+      ];
+    }
+
+    if (sentFilter === 'sent') {
+      where.credentialsSentAt = { not: null };
+    } else if (sentFilter === 'unsent') {
+      where.credentialsSentAt = null;
+    }
+
+    const students = await this.prisma.student.findMany({
+      where,
+      orderBy: { fullName: 'asc' },
+      select: {
+        id: true,
+        fullName: true,
+        phone1: true,
+        phone2: true,
+        credentialsSentAt: true,
+        lastCredentialReset: true,
+        instructor: { select: { fullName: true } },
+        user: { select: { username: true } },
+      },
+    });
+
+    return {
+      data: students.map((s) => ({
+        id: s.id,
+        fullName: s.fullName,
+        username: s.user.username,
+        phone1: s.phone1,
+        phone2: s.phone2,
+        instructorName: s.instructor.fullName,
+        credentialsSentAt: s.credentialsSentAt,
+        lastCredentialReset: s.lastCredentialReset,
+      })),
+      meta: {
+        total: students.length,
+        sent: students.filter((s) => s.credentialsSentAt != null).length,
+        unsent: students.filter((s) => s.credentialsSentAt == null).length,
+      },
+    };
+  }
+
+  /**
+   * Mark a student's credentials as having been sent to the parent.
+   * Called by Flutter after the admin confirms the WhatsApp send.
+   */
+  async markCredentialsSent(id: string) {
+    const student = await this.prisma.student.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!student) {
+      throw new NotFoundException('الطالب غير موجود');
+    }
+
+    await this.prisma.student.update({
+      where: { id },
+      data: { credentialsSentAt: new Date() },
+    });
+
+    return { message: 'تم تسجيل إرسال البيانات' };
+  }
+
+  /**
+   * One-time bulk regeneration of every student's credentials.
+   * This is the migration helper for moving from the old manual scheme
+   * to the new YYYYNNNN system. Returns ALL plain passwords ONCE so the
+   * caller can immediately save them to an Excel file. After this call
+   * returns, the passwords are gone forever.
+   *
+   * Idempotency safety: this endpoint is dangerous. The controller
+   * requires a confirmation token in the request body to prevent
+   * accidental invocation.
+   */
+  async regenerateAllCredentials(): Promise<{
+    message: string;
+    count: number;
+    credentials: Array<{
+      studentId: string;
+      fullName: string;
+      username: string;
+      password: string;
+      phone1: string | null;
+      phone2: string | null;
+      instructorName: string;
+    }>;
+  }> {
+    const students = await this.prisma.student.findMany({
+      where: { deletedAt: null },
+      orderBy: [{ dateOfBirth: 'asc' }, { createdAt: 'asc' }],
+      include: {
+        user: true,
+        instructor: { select: { fullName: true } },
+      },
+    });
+
+    const results: Array<{
+      studentId: string;
+      fullName: string;
+      username: string;
+      password: string;
+      phone1: string | null;
+      phone2: string | null;
+      instructorName: string;
+    }> = [];
+
+    // Group by birth year so we can assign sequential numbers per year.
+    // We process in chronological order of creation within each year so
+    // older students get lower numbers (more intuitive).
+    const yearCounters = new Map<number, number>();
+
+    for (const student of students) {
+      const year = student.dateOfBirth.getFullYear();
+      const next = (yearCounters.get(year) ?? 0) + 1;
+      yearCounters.set(year, next);
+
+      const username = `${year}${next.toString().padStart(4, '0')}`;
+      const plainPassword = generatePassword();
+      const passwordHash = await hashPassword(plainPassword);
+
+      // Update both user and student tables in a single transaction
+      await this.prisma.$transaction([
+        this.prisma.user.update({
+          where: { id: student.userId },
+          data: { username, passwordHash },
+        }),
+        this.prisma.student.update({
+          where: { id: student.id },
+          data: {
+            lastCredentialReset: new Date(),
+            credentialsSentAt: null, // Reset sent status — admin must redistribute
+          },
+        }),
+      ]);
+
+      results.push({
+        studentId: student.id,
+        fullName: student.fullName,
+        username,
+        password: plainPassword,
+        phone1: student.phone1,
+        phone2: student.phone2,
+        instructorName: student.instructor.fullName,
+      });
+    }
+
+    return {
+      message: `تم إنشاء بيانات دخول جديدة لـ ${results.length} طالب`,
+      count: results.length,
+      credentials: results,
     };
   }
 }

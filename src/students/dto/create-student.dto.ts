@@ -1,16 +1,25 @@
-import { IsString, IsOptional, IsDateString, IsUUID } from 'class-validator';
+import {
+  IsString,
+  IsOptional,
+  IsDateString,
+  IsUUID,
+  IsNotEmpty,
+  Matches,
+} from 'class-validator';
 
 export class CreateStudentDto {
   @IsString()
+  @IsNotEmpty({ message: 'الاسم الكامل مطلوب' })
   fullName: string;
 
   @IsString()
+  @IsNotEmpty({ message: 'اسم الأب مطلوب' })
   fatherName: string;
 
-  @IsDateString()
+  @IsDateString({}, { message: 'تاريخ الميلاد غير صالح' })
   dateOfBirth: string;
 
-  @IsUUID()
+  @IsUUID('4', { message: 'معرف المعلم غير صالح' })
   instructorId: string;
 
   @IsOptional()
@@ -21,21 +30,26 @@ export class CreateStudentDto {
   @IsString()
   address?: string;
 
-  @IsOptional()
+  /**
+   * Parent's primary phone — required.
+   * Syrian formats accepted:
+   *   +963XXXXXXXXX  (international, 9 digits after country code)
+   *   963XXXXXXXXX   (without +)
+   *   09XXXXXXXX     (local, 10 digits starting with 09)
+   */
   @IsString()
-  phone1?: string;
+  @IsNotEmpty({ message: 'رقم هاتف ولي الأمر مطلوب' })
+  @Matches(/^(\+?963\d{9}|09\d{8})$/, {
+    message: 'رقم الهاتف غير صالح. الصيغة: +963XXXXXXXXX أو 09XXXXXXXX',
+  })
+  phone1: string;
 
   @IsOptional()
   @IsString()
+  @Matches(/^(\+?963\d{9}|09\d{8})$/, {
+    message: 'رقم الهاتف الثاني غير صالح',
+  })
   phone2?: string;
-
-  @IsOptional()
-  @IsString()
-  username?: string;
-
-  @IsOptional()
-  @IsString()
-  password?: string;
 
   @IsOptional()
   @IsString()

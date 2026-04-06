@@ -10,6 +10,7 @@ import {
   UseGuards,
   Request,
   ParseUUIDPipe,
+  BadRequestException,
 } from '@nestjs/common';
 import { StudentsService } from './students.service';
 import { CreateStudentDto } from './dto/create-student.dto';
@@ -47,6 +48,40 @@ export class StudentsController {
     });
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // CREDENTIALS MANAGEMENT — admin-only
+  // IMPORTANT: these routes must be declared BEFORE any `:id` route
+  // because NestJS matches routes in declaration order. Otherwise
+  // `credentials` would be parsed as a UUID and fail.
+  // ═══════════════════════════════════════════════════════════════
+
+  // GET /api/v1/students/credentials/list
+  @Get('credentials/list')
+  @Roles('ADMIN')
+  listCredentials(
+    @Query('search') search?: string,
+    @Query('sentFilter') sentFilter?: 'all' | 'sent' | 'unsent',
+  ) {
+    return this.studentsService.listCredentials({ search, sentFilter });
+  }
+
+  // POST /api/v1/students/credentials/regenerate-all
+  // Dangerous! Requires explicit confirmation token in body.
+  @Post('credentials/regenerate-all')
+  @Roles('ADMIN')
+  regenerateAll(@Body('confirmationToken') token: string) {
+    if (token !== 'REGENERATE_ALL_STUDENT_CREDENTIALS_CONFIRMED') {
+      throw new BadRequestException(
+        'رمز التأكيد غير صحيح. هذا الإجراء يتطلب تأكيداً صريحاً.',
+      );
+    }
+    return this.studentsService.regenerateAllCredentials();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // STUDENT-SPECIFIC ROUTES — must come AFTER static credential routes
+  // ═══════════════════════════════════════════════════════════════
+
   @Get(':id')
   @Roles('ADMIN', 'INSTRUCTOR')
   findOne(@Param('id', ParseUUIDPipe) id: string) {
@@ -68,13 +103,19 @@ export class StudentsController {
     return this.studentsService.update(id, dto);
   }
 
+  // POST /api/v1/students/:id/reset-password
+  // Generates a fresh random password — the admin no longer chooses it.
   @Post(':id/reset-password')
   @Roles('ADMIN')
-  resetPassword(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body('password') password: string,
-  ) {
-    return this.studentsService.resetPassword(id, password);
+  resetPassword(@Param('id', ParseUUIDPipe) id: string) {
+    return this.studentsService.resetPassword(id);
+  }
+
+  // POST /api/v1/students/:id/mark-credentials-sent
+  @Post(':id/mark-credentials-sent')
+  @Roles('ADMIN')
+  markCredentialsSent(@Param('id', ParseUUIDPipe) id: string) {
+    return this.studentsService.markCredentialsSent(id);
   }
 
   @Delete(':id')
