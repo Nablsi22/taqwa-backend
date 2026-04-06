@@ -4,8 +4,9 @@ import {
   IsNumber,
   IsEnum,
   IsOptional,
-  IsBoolean,
   IsDateString,
+  IsArray,
+  ArrayMinSize,
   Min,
   Max,
 } from 'class-validator';
@@ -22,18 +23,21 @@ export class CreateRecitationDto {
   @IsString()
   studentId: string;
 
-  @IsInt()
-  @Min(1)
-  @Max(114)
-  surahNumber: number;
+  /**
+   * Array of surah numbers selected by the instructor.
+   * Always at least 1. For single-surah entries the array has one element;
+   * for multi-surah entries (e.g. several short surahs in Juz 30) it has many.
+   */
+  @IsArray()
+  @ArrayMinSize(1)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @Max(114, { each: true })
+  surahNumbers: number[];
 
   @IsNumber()
   @Min(0)
   pagesRecited: number;
-
-  @IsBoolean()
-  @IsOptional()
-  isCompleteSura?: boolean;
 
   @IsEnum(RecitationRatingDto)
   rating: RecitationRatingDto;

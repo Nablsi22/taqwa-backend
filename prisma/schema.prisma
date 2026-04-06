@@ -196,7 +196,8 @@ model Recitation {
   id             String           @id @default(uuid())
   studentId      String           @map("student_id")
   instructorId   String           @map("instructor_id")
-  surahNumber    Int              @map("surah_number")
+  surahNumber    Int              @map("surah_number")           // kept for backward compat
+  surahNumbers   Int[]            @default([]) @map("surah_numbers") // NEW
   pagesRecited   Float            @default(0) @map("pages_recited")
   isCompleteSura Boolean          @default(false) @map("is_complete_sura")
   rating         RecitationRating

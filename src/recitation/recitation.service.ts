@@ -1,12 +1,18 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { CreateRecitationDto, BulkMaqraaDto } from './dto/create-recitation.dto';
+import {
+  CreateRecitationDto,
+  BulkMaqraaDto,
+} from './dto/create-recitation.dto';
 import { PointRulesService } from '../point-rules/point-rules.service';
 import {
   SURA_METADATA,
   getSuraByNumber,
   getSuraName,
-  getSuraTotalPages,
   TOTAL_QURAN_PAGES,
 } from '../quran-metadata/quran-metadata';
 
@@ -18,7 +24,7 @@ export class RecitationService {
   ) {}
 
   // ═══════════════════════════════════════════════════════════
-  // CREATE — Single recitation entry
+  // Helpers
   // ═══════════════════════════════════════════════════════════
 
   private async resolveInstructorId(userId: string): Promise<string> {
@@ -29,12 +35,32 @@ export class RecitationService {
     return userId;
   }
 
+  /**
+   * Backward-compat reader: prefer the new `surahNumbers` array,
+   * fall back to `[surahNumber]` for legacy rows.
+   */
+  private surahNumsOf(rec: {
+    surahNumbers: number[] | null;
+    surahNumber: number;
+  }): number[] {
+    if (rec.surahNumbers && rec.surahNumbers.length > 0) {
+      return rec.surahNumbers;
+    }
+    return [rec.surahNumber];
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // CREATE — Single recitation entry (supports multi-surah)
+  // ═══════════════════════════════════════════════════════════
+
   async create(dto: CreateRecitationDto, instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
 
-    const sura = getSuraByNumber(dto.surahNumber);
-    if (!sura) {
-      throw new BadRequestException(`رقم السورة غير صالح: ${dto.surahNumber}`);
+    // Validate all surah numbers
+    for (const n of dto.surahNumbers) {
+      if (!getSuraByNumber(n)) {
+        throw new BadRequestException(`رقم السورة غير صالح: ${n}`);
+      }
     }
 
     const student = await this.prisma.student.findUnique({
@@ -44,17 +70,33 @@ export class RecitationService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
-    const pagesRecited = dto.isCompleteSura
-      ? sura.totalPages
-      : dto.pagesRecited;
+    // Determine pages: multi-select uses auto sum, single-select uses DTO value
+    const isMulti = dto.surahNumbers.length > 1;
+    let pagesRecited: number;
+
+    if (isMulti) {
+      // Sum of real mushaf pages for every selected surah
+      pagesRecited = dto.surahNumbers.reduce((sum, n) => {
+        const s = getSuraByNumber(n);
+        return sum + (s?.totalPages ?? 0);
+      }, 0);
+      // Round to 2 decimals to keep numbers clean
+      pagesRecited = Math.round(pagesRecited * 100) / 100;
+    } else {
+      // Single-surah: honor whatever the instructor entered (supports partial)
+      pagesRecited = dto.pagesRecited;
+    }
+
+    const primarySurah = dto.surahNumbers[0];
 
     const recitation = await this.prisma.recitation.create({
       data: {
         studentId: dto.studentId,
         instructorId,
-        surahNumber: dto.surahNumber,
+        surahNumber: primarySurah, // backward compat
+        surahNumbers: dto.surahNumbers, // new source of truth
         pagesRecited,
-        isCompleteSura: dto.isCompleteSura || false,
+        isCompleteSura: isMulti, // multi-select implies each full
         rating: dto.rating,
         homework: dto.homework || null,
         date: new Date(dto.date),
@@ -69,15 +111,20 @@ export class RecitationService {
       pagesRecited,
     );
 
+    const suraNames = dto.surahNumbers.map((n) => getSuraName(n));
+
     return {
-      data: recitation,
-      suraName: sura.nameAr,
+      data: {
+        ...recitation,
+        suraNames,
+      },
+      suraName: suraNames.join('، '),
       message: 'تم تسجيل التسميع بنجاح',
     };
   }
 
   // ═══════════════════════════════════════════════════════════
-  // BULK MAQRAA — Group reading for all selected students
+  // BULK MAQRAA — unchanged (single-surah group activity)
   // ═══════════════════════════════════════════════════════════
 
   async createBulkMaqraa(dto: BulkMaqraaDto, instructorId: string) {
@@ -96,6 +143,7 @@ export class RecitationService {
           studentId,
           instructorId,
           surahNumber: dto.surahNumber,
+          surahNumbers: [dto.surahNumber],
           pagesRecited: dto.pagesRecited || 0,
           isCompleteSura: false,
           rating: 'MAQRAA',
@@ -103,7 +151,6 @@ export class RecitationService {
         },
       });
 
-      // —— FIX: MAQRAA now gets points too ——
       await this.applyRecitationPoints(
         studentId,
         instructorId,
@@ -123,7 +170,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // POINTS — Auto-apply based on rating (FIXED)
+  // POINTS — Auto-apply based on rating (unchanged)
   // ═══════════════════════════════════════════════════════════
 
   private async applyRecitationPoints(
@@ -133,14 +180,19 @@ export class RecitationService {
     pageCount: number,
   ) {
     try {
-      if (rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE' || pageCount <= 0) {
+      if (
+        rating === 'REPEAT' ||
+        rating === 'DID_NOT_MEMORIZE' ||
+        pageCount <= 0
+      ) {
         return;
       }
 
       let pointResult: { points: number; ruleNameAr: string } | null = null;
 
       if (rating === 'MAQRAA') {
-        const maqraaRule = await this.pointRulesService.findByCode('RECITE_MAQRAA');
+        const maqraaRule =
+          await this.pointRulesService.findByCode('RECITE_MAQRAA');
         if (maqraaRule && maqraaRule.isActive) {
           const pts = maqraaRule.isPerPage
             ? maqraaRule.points * pageCount
@@ -191,7 +243,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // STUDENT PROGRESS — Cumulative sura tracking (FIXED)
+  // STUDENT PROGRESS — updated for multi-surah entries
   // ═══════════════════════════════════════════════════════════
 
   async getStudentProgress(studentId: string) {
@@ -200,7 +252,7 @@ export class RecitationService {
       orderBy: { date: 'asc' },
     });
 
-    const suraProgressMap = new Map<
+    const suraProgressMap = new Map
       number,
       {
         individualPages: number;
@@ -211,26 +263,42 @@ export class RecitationService {
     >();
 
     for (const rec of recitations) {
-      if (!suraProgressMap.has(rec.surahNumber)) {
-        suraProgressMap.set(rec.surahNumber, {
-          individualPages: 0,
-          isComplete: false,
-          lastDate: null,
-          lastRating: null,
-        });
+      const surahNums = this.surahNumsOf(rec);
+      const isMulti = surahNums.length > 1;
+
+      for (const surahNum of surahNums) {
+        if (!suraProgressMap.has(surahNum)) {
+          suraProgressMap.set(surahNum, {
+            individualPages: 0,
+            isComplete: false,
+            lastDate: null,
+            lastRating: null,
+          });
+        }
+
+        const progress = suraProgressMap.get(surahNum)!;
+        const sura = getSuraByNumber(surahNum);
+
+        if (rec.rating === 'VERY_GOOD' || rec.rating === 'GOOD') {
+          if (isMulti) {
+            // Multi-select: every selected surah counts as fully memorized
+            progress.individualPages += sura?.totalPages ?? 0;
+            progress.isComplete = true;
+          } else {
+            // Single-surah: honor the pages the instructor entered
+            progress.individualPages += rec.pagesRecited;
+            if (
+              rec.isCompleteSura ||
+              progress.individualPages >= (sura?.totalPages ?? Infinity)
+            ) {
+              progress.isComplete = true;
+            }
+          }
+        }
+
+        progress.lastDate = rec.date;
+        progress.lastRating = rec.rating;
       }
-
-      const progress = suraProgressMap.get(rec.surahNumber)!;
-
-      if (rec.isCompleteSura) {
-        progress.isComplete = true;
-        progress.individualPages += rec.pagesRecited;
-      } else if (rec.rating === 'VERY_GOOD' || rec.rating === 'GOOD') {
-        progress.individualPages += rec.pagesRecited;
-      }
-
-      progress.lastDate = rec.date;
-      progress.lastRating = rec.rating;
     }
 
     const suraProgress = SURA_METADATA.map((sura) => {
@@ -282,7 +350,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // RECITATION HISTORY — For a specific student
+  // RECITATION HISTORY — joined surah names for multi-surah
   // ═══════════════════════════════════════════════════════════
 
   async getStudentRecitations(studentId: string) {
@@ -292,15 +360,21 @@ export class RecitationService {
     });
 
     return {
-      data: recitations.map((rec) => ({
-        ...rec,
-        suraName: getSuraName(rec.surahNumber),
-      })),
+      data: recitations.map((rec) => {
+        const surahNums = this.surahNumsOf(rec);
+        const suraNames = surahNums.map((n) => getSuraName(n));
+        return {
+          ...rec,
+          surahNumbers: surahNums,
+          suraName: suraNames.join('، '),
+          suraNames,
+        };
+      }),
     };
   }
 
   // ═══════════════════════════════════════════════════════════
-  // LATEST HOMEWORK — Get the most recent homework for a student
+  // LATEST HOMEWORK
   // ═══════════════════════════════════════════════════════════
 
   async getStudentHomework(studentId: string) {
@@ -317,15 +391,18 @@ export class RecitationService {
       return { homework: null, date: null, suraName: null };
     }
 
+    const surahNums = this.surahNumsOf(latestWithHomework);
+    const suraNames = surahNums.map((n) => getSuraName(n));
+
     return {
       homework: latestWithHomework.homework,
       date: latestWithHomework.date,
-      suraName: getSuraName(latestWithHomework.surahNumber),
+      suraName: suraNames.join('، '),
     };
   }
 
   // ═══════════════════════════════════════════════════════════
-  // INSTRUCTOR OVERVIEW — All students' progress (FIXED)
+  // INSTRUCTOR OVERVIEW — updated for multi-surah entries
   // ═══════════════════════════════════════════════════════════
 
   async getInstructorOverview(instructorId: string) {
@@ -349,13 +426,31 @@ export class RecitationService {
           studentId: student.id,
           rating: { in: ['VERY_GOOD', 'GOOD'] },
         },
-        select: { surahNumber: true, pagesRecited: true, isCompleteSura: true },
+        select: {
+          surahNumber: true,
+          surahNumbers: true,
+          pagesRecited: true,
+          isCompleteSura: true,
+        },
       });
 
       const suraPages = new Map<number, number>();
       for (const rec of recitations) {
-        const current = suraPages.get(rec.surahNumber) || 0;
-        suraPages.set(rec.surahNumber, current + rec.pagesRecited);
+        const nums = this.surahNumsOf(rec);
+
+        if (nums.length > 1) {
+          // Multi-select: each selected surah gets its full metadata pages
+          for (const n of nums) {
+            const sura = getSuraByNumber(n);
+            const current = suraPages.get(n) || 0;
+            suraPages.set(n, current + (sura?.totalPages || 0));
+          }
+        } else {
+          // Single-surah: use pagesRecited (may be partial)
+          const n = nums[0];
+          const current = suraPages.get(n) || 0;
+          suraPages.set(n, current + rec.pagesRecited);
+        }
       }
 
       let totalPages = 0;
@@ -365,6 +460,11 @@ export class RecitationService {
         totalPages += Math.min(pages, cap);
       }
 
+      const lastNums = lastRecitation
+        ? this.surahNumsOf(lastRecitation)
+        : [];
+      const lastNames = lastNums.map((n) => getSuraName(n));
+
       overview.push({
         studentId: student.id,
         fullName: student.fullName,
@@ -372,9 +472,7 @@ export class RecitationService {
         overallPercentage:
           Math.round((totalPages / TOTAL_QURAN_PAGES) * 100 * 10) / 10,
         lastSurah: lastRecitation?.surahNumber || null,
-        lastSurahName: lastRecitation
-          ? getSuraName(lastRecitation.surahNumber)
-          : null,
+        lastSurahName: lastNames.length > 0 ? lastNames.join('، ') : null,
         lastRating: lastRecitation?.rating || null,
         lastDate: lastRecitation?.date || null,
         homework: lastRecitation?.homework || null,
@@ -385,7 +483,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // QURAN METADATA — Exposed for frontend sura picker
+  // QURAN METADATA
   // ═══════════════════════════════════════════════════════════
 
   getSuraList() {
@@ -400,7 +498,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // DELETE RECITATION — Admin only
+  // DELETE
   // ═══════════════════════════════════════════════════════════
 
   async deleteRecitation(id: string) {
