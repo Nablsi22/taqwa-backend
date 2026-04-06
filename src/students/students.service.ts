@@ -450,6 +450,31 @@ export class StudentsService {
       },
     });
 
+    if (students.length === 0) {
+      return { message: 'لا يوجد طلاب', count: 0, credentials: [] };
+    }
+
+    // ─── PHASE 1: Park all student usernames in a temporary unique
+    // namespace to avoid ANY collision when assigning new ones.
+    // We use the user's UUID (always unique) prefixed with "tmp_".
+    // ─────────────────────────────────────────────────────────────
+    try {
+      await this.prisma.$transaction(
+        students.map((s) =>
+          this.prisma.user.update({
+            where: { id: s.userId },
+            data: { username: `tmp_${s.userId}` },
+          }),
+        ),
+      );
+    } catch (err) {
+      console.error('[regenerateAll] phase 1 (parking) failed:', err);
+      throw new BadRequestException(
+        `فشل المرحلة الأولى من التحديث: ${err?.message || err}`,
+      );
+    }
+
+    // ─── PHASE 2: Assign final YYYYNNNN usernames + new passwords ───
     const results: Array<{
       studentId: string;
       fullName: string;
@@ -460,44 +485,50 @@ export class StudentsService {
       instructorName: string;
     }> = [];
 
-    // Group by birth year so we can assign sequential numbers per year.
-    // We process in chronological order of creation within each year so
-    // older students get lower numbers (more intuitive).
     const yearCounters = new Map<number, number>();
 
     for (const student of students) {
-      const year = student.dateOfBirth.getFullYear();
-      const next = (yearCounters.get(year) ?? 0) + 1;
-      yearCounters.set(year, next);
+      try {
+        const year = student.dateOfBirth.getFullYear();
+        const next = (yearCounters.get(year) ?? 0) + 1;
+        yearCounters.set(year, next);
 
-      const username = `${year}${next.toString().padStart(4, '0')}`;
-      const plainPassword = generatePassword();
-      const passwordHash = await hashPassword(plainPassword);
+        const username = `${year}${next.toString().padStart(4, '0')}`;
+        const plainPassword = generatePassword();
+        const passwordHash = await hashPassword(plainPassword);
 
-      // Update both user and student tables in a single transaction
-      await this.prisma.$transaction([
-        this.prisma.user.update({
-          where: { id: student.userId },
-          data: { username, passwordHash },
-        }),
-        this.prisma.student.update({
-          where: { id: student.id },
-          data: {
-            lastCredentialReset: new Date(),
-            credentialsSentAt: null, // Reset sent status — admin must redistribute
-          },
-        }),
-      ]);
+        await this.prisma.$transaction([
+          this.prisma.user.update({
+            where: { id: student.userId },
+            data: { username, passwordHash },
+          }),
+          this.prisma.student.update({
+            where: { id: student.id },
+            data: {
+              lastCredentialReset: new Date(),
+              credentialsSentAt: null,
+            },
+          }),
+        ]);
 
-      results.push({
-        studentId: student.id,
-        fullName: student.fullName,
-        username,
-        password: plainPassword,
-        phone1: student.phone1,
-        phone2: student.phone2,
-        instructorName: student.instructor.fullName,
-      });
+        results.push({
+          studentId: student.id,
+          fullName: student.fullName,
+          username,
+          password: plainPassword,
+          phone1: student.phone1,
+          phone2: student.phone2,
+          instructorName: student.instructor.fullName,
+        });
+      } catch (err) {
+        console.error(
+          `[regenerateAll] failed for student ${student.id} (${student.fullName}):`,
+          err,
+        );
+        throw new BadRequestException(
+          `فشل تحديث الطالب ${student.fullName}: ${err?.message || err}`,
+        );
+      }
     }
 
     return {
