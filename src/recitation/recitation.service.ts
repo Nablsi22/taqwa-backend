@@ -252,15 +252,14 @@ export class RecitationService {
       orderBy: { date: 'asc' },
     });
 
-    const suraProgressMap = new Map
-      number,
-      {
-        individualPages: number;
-        isComplete: boolean;
-        lastDate: Date | null;
-        lastRating: string | null;
-      }
-    >();
+    type SuraProgress = {
+      individualPages: number;
+      isComplete: boolean;
+      lastDate: Date | null;
+      lastRating: string | null;
+    };
+
+    const suraProgressMap = new Map<number, SuraProgress>();
 
     for (const rec of recitations) {
       const surahNums = this.surahNumsOf(rec);
