@@ -7,6 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInstructorDto } from './dto/create-instructor.dto';
 import { UpdateInstructorDto } from './dto/update-instructor.dto';
+import { Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
 @Injectable()
@@ -14,13 +15,22 @@ export class InstructorsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * List all instructors with student count and optional search
+   * List all instructors with student count and optional search.
+   * When `all=true`, pagination is bypassed and every matching
+   * record is returned (hard-capped at 2000 to protect the server).
    */
-  async findAll(params?: { search?: string; page?: number; limit?: number }) {
-    const { search, page = 1, limit = 20 } = params || {};
+  async findAll(params?: {
+    search?: string;
+    page?: number;
+    limit?: number;
+    all?: boolean;
+  }) {
+    const { search, all = false } = params || {};
+    const page = Math.max(1, params?.page ?? 1);
+    const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
     const skip = (page - 1) * limit;
 
-    const where: any = {};
+    const where: Prisma.InstructorWhereInput = {};
 
     if (search) {
       where.OR = [
@@ -30,39 +40,40 @@ export class InstructorsService {
       ];
     }
 
-    const [instructors, total] = await Promise.all([
-      this.prisma.instructor.findMany({
-        where,
-        select: {
-          id: true,
-          fullName: true,
-          dateOfBirth: true,
-          specialty: true,
-          address: true,
-          mobile: true,
-          createdAt: true,
-          updatedAt: true,
-          user: {
-            select: {
-              id: true,
-              username: true,
-            },
-          },
-          _count: {
-            select: {
-              students: true,
-            },
+    const findManyArgs: Prisma.InstructorFindManyArgs = {
+      where,
+      select: {
+        id: true,
+        fullName: true,
+        dateOfBirth: true,
+        specialty: true,
+        address: true,
+        mobile: true,
+        createdAt: true,
+        updatedAt: true,
+        user: {
+          select: {
+            id: true,
+            username: true,
           },
         },
-        orderBy: { fullName: 'asc' },
-        skip,
-        take: limit,
-      }),
+        _count: {
+          select: {
+            students: true,
+          },
+        },
+      },
+      orderBy: { fullName: 'asc' },
+      ...(all ? { take: 2000 } : { skip, take: limit }),
+    };
+
+    const [instructors, total] = await Promise.all([
+      this.prisma.instructor.findMany(findManyArgs),
       this.prisma.instructor.count({ where }),
     ]);
 
     return {
-      data: instructors.map((inst) => ({
+      data: instructors.map((inst: any) => ({
         id: inst.id,
         userId: inst.user.id,
         username: inst.user.username,
@@ -77,9 +88,9 @@ export class InstructorsService {
       })),
       meta: {
         total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
+        page: all ? 1 : page,
+        limit: all ? total : limit,
+        totalPages: all ? 1 : Math.ceil(total / limit),
       },
     };
   }
@@ -146,7 +157,6 @@ export class InstructorsService {
    * Create a new instructor — creates User + Instructor records
    */
   async create(dto: CreateInstructorDto) {
-    // Check if username already exists
     const existingUser = await this.prisma.user.findUnique({
       where: { username: dto.username },
     });
@@ -155,10 +165,8 @@ export class InstructorsService {
       throw new ConflictException('اسم المستخدم مستخدم بالفعل');
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(dto.password, 12);
 
-    // Create User + Instructor in a transaction
     const result = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
@@ -204,7 +212,6 @@ export class InstructorsService {
    * Update instructor details
    */
   async update(id: string, dto: UpdateInstructorDto) {
-    // Verify instructor exists
     const existing = await this.prisma.instructor.findUnique({
       where: { id },
       include: { user: true },
@@ -214,7 +221,6 @@ export class InstructorsService {
       throw new NotFoundException('المعلم غير موجود');
     }
 
-    // If username is being changed, check for duplicates
     if (dto.username && dto.username !== existing.user.username) {
       const duplicate = await this.prisma.user.findUnique({
         where: { username: dto.username },
@@ -224,9 +230,7 @@ export class InstructorsService {
       }
     }
 
-    // Update in transaction
     const result = await this.prisma.$transaction(async (tx) => {
-      // Update User if needed
       const userData: any = {};
       if (dto.username) userData.username = dto.username;
       if (dto.password) {
@@ -239,13 +243,16 @@ export class InstructorsService {
         });
       }
 
-      // Update Instructor
       const instructorData: any = {};
       if (dto.fullName) instructorData.fullName = dto.fullName;
-      if (dto.dateOfBirth !== undefined) instructorData.dateOfBirth = dto.dateOfBirth || null;
-      if (dto.specialty !== undefined) instructorData.specialty = dto.specialty || null;
-      if (dto.address !== undefined) instructorData.address = dto.address || null;
-      if (dto.mobile !== undefined) instructorData.mobile = dto.mobile || null;
+      if (dto.dateOfBirth !== undefined)
+        instructorData.dateOfBirth = dto.dateOfBirth || null;
+      if (dto.specialty !== undefined)
+        instructorData.specialty = dto.specialty || null;
+      if (dto.address !== undefined)
+        instructorData.address = dto.address || null;
+      if (dto.mobile !== undefined)
+        instructorData.mobile = dto.mobile || null;
 
       const updated = await tx.instructor.update({
         where: { id },
@@ -307,7 +314,6 @@ export class InstructorsService {
       );
     }
 
-    // Delete both Instructor and User in transaction
     await this.prisma.$transaction(async (tx) => {
       await tx.instructor.delete({ where: { id } });
       await tx.user.delete({ where: { id: instructor.userId } });
@@ -331,7 +337,9 @@ export class InstructorsService {
     }
 
     if (!newPassword || newPassword.length < 6) {
-      throw new BadRequestException('كلمة المرور يجب أن تكون 6 أحرف على الأقل');
+      throw new BadRequestException(
+        'كلمة المرور يجب أن تكون 6 أحرف على الأقل',
+      );
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 12);

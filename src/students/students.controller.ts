@@ -36,12 +36,14 @@ export class StudentsController {
     @Query('instructorId') instructorId?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('all') all?: string,
   ) {
     return this.studentsService.findAll({
       search,
       instructorId,
-      page: page ? parseInt(page) : 1,
-      limit: limit ? parseInt(limit) : 20,
+      page: page ? parseInt(page, 10) : 1,
+      limit: limit ? parseInt(limit, 10) : 50,
+      all: all === 'true' || all === '1',
     });
   }
 
@@ -66,7 +68,6 @@ export class StudentsController {
     return this.studentsService.update(id, dto);
   }
 
-  // POST /api/v1/students/:id/reset-password
   @Post(':id/reset-password')
   @Roles('ADMIN')
   resetPassword(

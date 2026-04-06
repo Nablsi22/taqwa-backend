@@ -24,7 +24,9 @@ export class InstructorsController {
 
   /**
    * GET /api/v1/instructors
-   * List all instructors (admin only)
+   * List all instructors (admin only).
+   * Supports pagination via ?page & ?limit, or ?all=true to fetch
+   * every record in a single response (capped server-side).
    */
   @Get()
   @Roles('ADMIN')
@@ -32,11 +34,13 @@ export class InstructorsController {
     @Query('search') search?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('all') all?: string,
   ) {
     return this.instructorsService.findAll({
       search,
       page: page ? parseInt(page, 10) : 1,
-      limit: limit ? parseInt(limit, 10) : 20,
+      limit: limit ? parseInt(limit, 10) : 50,
+      all: all === 'true' || all === '1',
     });
   }
 

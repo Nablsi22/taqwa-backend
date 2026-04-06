@@ -6,6 +6,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
+import { Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
 @Injectable()
@@ -13,7 +14,6 @@ export class StudentsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async create(dto: CreateStudentDto, createdByUserId: string) {
-    // Verify instructor exists
     const instructor = await this.prisma.instructor.findUnique({
       where: { id: dto.instructorId },
     });
@@ -21,7 +21,6 @@ export class StudentsService {
       throw new BadRequestException('المعلم غير موجود');
     }
 
-    // Create a User account for the student
     const username =
       dto.username || dto.fullName.replace(/\s+/g, '.').toLowerCase();
     const password = dto.password || 'Taqwa@2026';
@@ -63,11 +62,15 @@ export class StudentsService {
     instructorId?: string;
     page?: number;
     limit?: number;
+    all?: boolean;
   }) {
-    const { search, instructorId, page = 1, limit = 20 } = params || {};
+    const { search, instructorId, all = false } = params || {};
+    const page = Math.max(1, params?.page ?? 1);
+    // Raised default from 20 → 50. Hard cap at 500 to protect the server.
+    const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
     const skip = (page - 1) * limit;
 
-    const where: any = { deletedAt: null };
+    const where: Prisma.StudentWhereInput = { deletedAt: null };
 
     if (search) {
       where.OR = [
@@ -82,44 +85,78 @@ export class StudentsService {
       where.instructorId = instructorId;
     }
 
-    const [students, total] = await Promise.all([
-      this.prisma.student.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy: { fullName: 'asc' },
-        include: {
-          user: { select: { username: true } },
-          instructor: {
-            include: { user: { select: { username: true } } },
-          },
-          _count: { select: { attendance: true, pointsLog: true } },
+    // When `all=true` the client explicitly opts out of pagination.
+    // Still cap at 2000 to avoid accidental OOM.
+    const findManyArgs: Prisma.StudentFindManyArgs = {
+      where,
+      orderBy: { fullName: 'asc' },
+      include: {
+        user: { select: { username: true } },
+        instructor: {
+          include: { user: { select: { username: true } } },
         },
-      }),
+        _count: { select: { attendance: true, pointsLog: true } },
+      },
+      ...(all ? { take: 2000 } : { skip, take: limit }),
+    };
+
+    const [students, total] = await Promise.all([
+      this.prisma.student.findMany(findManyArgs),
       this.prisma.student.count({ where }),
     ]);
 
-    // Calculate total points for each student
-    const studentsWithPoints = await Promise.all(
-      students.map(async (student) => {
-        const pointsAgg = await this.prisma.pointsLog.aggregate({
-          where: { studentId: student.id },
+    // --- Performance fix: single aggregated query instead of N+1 ---
+    // Previous code ran one aggregate() per student. For 100 students
+    // that was 100 extra round-trips. We now fetch all sums in one
+    // groupBy, split by category type so EARN and SPEND can be netted
+    // the same way findOne() does it.
+    const studentIds = students.map((s) => s.id);
+
+    const pointsGrouped = studentIds.length
+      ? await this.prisma.pointsLog.groupBy({
+          by: ['studentId', 'categoryId'],
+          where: { studentId: { in: studentIds } },
           _sum: { amount: true },
-        });
-        return {
-          ...student,
-          totalPoints: pointsAgg._sum.amount || 0,
-        };
-      }),
+        })
+      : [];
+
+    // We also need each category's type (EARN/SPEND) to net correctly.
+    const categoryIds = [
+      ...new Set(pointsGrouped.map((g) => g.categoryId)),
+    ];
+    const categories = categoryIds.length
+      ? await this.prisma.pointCategory.findMany({
+          where: { id: { in: categoryIds } },
+          select: { id: true, type: true },
+        })
+      : [];
+    const categoryTypeById = new Map(
+      categories.map((c) => [c.id, c.type]),
     );
+
+    const totalsByStudent = new Map<string, number>();
+    for (const row of pointsGrouped) {
+      const amount = row._sum.amount ?? 0;
+      const type = categoryTypeById.get(row.categoryId);
+      const signed = type === 'DEDUCT' ? -amount : amount;
+      totalsByStudent.set(
+        row.studentId,
+        (totalsByStudent.get(row.studentId) ?? 0) + signed,
+      );
+    }
+
+    const studentsWithPoints = students.map((student) => ({
+      ...student,
+      totalPoints: totalsByStudent.get(student.id) ?? 0,
+    }));
 
     return {
       data: studentsWithPoints,
       meta: {
         total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
+        page: all ? 1 : page,
+        limit: all ? total : limit,
+        totalPages: all ? 1 : Math.ceil(total / limit),
       },
     };
   }
@@ -149,11 +186,8 @@ export class StudentsService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
-    // Calculate total points
     const totalPoints = student.pointsLog.reduce((sum: number, p) => {
-      return p.category.type === 'EARN'
-        ? sum + p.amount
-        : sum - p.amount;
+      return p.category.type === 'EARN' ? sum + p.amount : sum - p.amount;
     }, 0);
 
     return { ...student, totalPoints };
@@ -177,7 +211,6 @@ export class StudentsService {
       }
     }
 
-    // Handle password reset
     if (dto.password) {
       const student = await this.prisma.student.findUnique({
         where: { id },
@@ -212,7 +245,8 @@ export class StudentsService {
       },
     });
   }
-async resetPassword(id: string, password: string) {
+
+  async resetPassword(id: string, password: string) {
     const student = await this.prisma.student.findUnique({
       where: { id },
       select: { userId: true, fullName: true },
@@ -227,9 +261,9 @@ async resetPassword(id: string, password: string) {
     });
     return { message: 'تم تغيير كلمة المرور بنجاح' };
   }
+
   async remove(id: string) {
     await this.findOne(id);
-    // Soft delete
     return this.prisma.student.update({
       where: { id },
       data: { deletedAt: new Date() },
