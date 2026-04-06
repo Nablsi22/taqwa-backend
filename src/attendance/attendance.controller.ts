@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Body,
   Query,
   Param,
@@ -24,7 +25,8 @@ export class AttendanceController {
   @Post('mark')
   @Roles('ADMIN', 'INSTRUCTOR')
   mark(@Body() dto: MarkAttendanceDto, @Request() req: any) {
-  return this.attendanceService.markAttendance(dto, req.user.id);  }
+    return this.attendanceService.markAttendance(dto, req.user.id);
+  }
 
   // GET /api/v1/attendance/sheet?date=2026-03-05&instructorId=xxx
   @Get('sheet')
@@ -56,8 +58,8 @@ export class AttendanceController {
     @Query('month') month?: string,
   ) {
     return this.attendanceService.getStudentHistory(studentId, {
-      page: page ? parseInt(page) : 1,
-      limit: limit ? parseInt(limit) : 30,
+      page: page ? parseInt(page, 10) : 1,
+      limit: limit ? parseInt(limit, 10) : 30,
       month,
     });
   }
@@ -67,5 +69,12 @@ export class AttendanceController {
   @Roles('ADMIN', 'INSTRUCTOR')
   getDayStats(@Query('date') date: string) {
     return this.attendanceService.getDayStats(date);
+  }
+
+  // DELETE /api/v1/attendance/:id — delete attendance + cascade points
+  @Delete(':id')
+  @Roles('ADMIN')
+  deleteAttendance(@Param('id', ParseUUIDPipe) id: string) {
+    return this.attendanceService.deleteAttendance(id);
   }
 }

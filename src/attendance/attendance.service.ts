@@ -75,7 +75,9 @@ export class AttendanceService {
       });
 
       // ═══════════════════════════════════════════════════════════
-      // AUTO-POINTS: Only on NEW records (not updates)
+      // AUTO-POINTS: Only on NEW records (not updates).
+      // Points are stamped with sourceId = attendance record ID so
+      // they can be cascaded away if the attendance is ever deleted.
       // ═══════════════════════════════════════════════════════════
       if (!existingRecord) {
         try {
@@ -84,9 +86,8 @@ export class AttendanceService {
           );
 
           if (ruleResult) {
-            const categoryId = ruleResult.points >= 0
-              ? earnCategoryId
-              : deductCategoryId;
+            const categoryId =
+              ruleResult.points >= 0 ? earnCategoryId : deductCategoryId;
 
             if (categoryId) {
               await this.prisma.pointsLog.create({
@@ -96,6 +97,8 @@ export class AttendanceService {
                   amount: ruleResult.points,
                   description: `${ruleResult.ruleNameAr} - ${dto.date}`,
                   awardedBy: markedByUserId,
+                  sourceId: record.id,
+                  sourceType: 'ATTENDANCE',
                 },
               });
             }
@@ -148,9 +151,7 @@ export class AttendanceService {
         studentId: { in: students.map((s) => s.id) },
       },
     });
-    const recordMap = new Map(
-      existingRecords.map((r) => [r.studentId, r]),
-    );
+    const recordMap = new Map(existingRecords.map((r) => [r.studentId, r]));
     const sheet = students.map((student) => {
       const record = recordMap.get(student.id);
       return {
@@ -170,11 +171,14 @@ export class AttendanceService {
     };
   }
 
-  async getStudentHistory(studentId: string, params?: {
-    page?: number;
-    limit?: number;
-    month?: string;
-  }) {
+  async getStudentHistory(
+    studentId: string,
+    params?: {
+      page?: number;
+      limit?: number;
+      month?: string;
+    },
+  ) {
     const { page = 1, limit = 30, month } = params || {};
     const skip = (page - 1) * limit;
     const where: any = { studentId };
@@ -226,9 +230,41 @@ export class AttendanceService {
       present: stats.find((s) => s.status === 'PRESENT')?._count || 0,
       late: stats.find((s) => s.status === 'LATE')?._count || 0,
       absent: stats.find((s) => s.status === 'ABSENT')?._count || 0,
-      unmarked:
-        totalStudents -
-        stats.reduce((sum, s) => sum + s._count, 0),
+      unmarked: totalStudents - stats.reduce((sum, s) => sum + s._count, 0),
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // DELETE ATTENDANCE — cascades the awarded points too
+  // ═══════════════════════════════════════════════════════════
+
+  async deleteAttendance(id: string) {
+    const record = await this.prisma.attendance.findUnique({
+      where: { id },
+    });
+
+    if (!record) {
+      throw new NotFoundException('سجل الحضور غير موجود');
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const deletedPoints = await tx.pointsLog.deleteMany({
+        where: {
+          sourceType: 'ATTENDANCE',
+          sourceId: id,
+        },
+      });
+
+      await tx.attendance.delete({ where: { id } });
+
+      return { deletedPointsCount: deletedPoints.count };
+    });
+
+    return {
+      message:
+        result.deletedPointsCount > 0
+          ? `تم حذف سجل الحضور وإلغاء ${result.deletedPointsCount} نقطة مرتبطة به`
+          : 'تم حذف سجل الحضور بنجاح',
     };
   }
 }

@@ -104,11 +104,13 @@ export class RecitationService {
     });
 
     // —— AUTO-POINTS: Apply points based on rating ——
+   // —— AUTO-POINTS: Apply points based on rating ——
     await this.applyRecitationPoints(
       dto.studentId,
       instructorId,
       dto.rating,
       pagesRecited,
+      recitation.id,
     );
 
     const suraNames = dto.surahNumbers.map((n) => getSuraName(n));
@@ -156,6 +158,7 @@ export class RecitationService {
         instructorId,
         'MAQRAA',
         dto.pagesRecited || 0,
+        recitation.id,
       );
 
       results.push(recitation);
@@ -173,11 +176,12 @@ export class RecitationService {
   // POINTS — Auto-apply based on rating (unchanged)
   // ═══════════════════════════════════════════════════════════
 
-  private async applyRecitationPoints(
+ private async applyRecitationPoints(
     studentId: string,
     instructorId: string,
     rating: string,
     pageCount: number,
+    sourceId: string,
   ) {
     try {
       if (
@@ -233,6 +237,8 @@ export class RecitationService {
               rating: rating as any,
               description: pointResult.ruleNameAr,
               awardedBy: instructorId,
+              sourceId,
+              sourceType: 'RECITATION',
             },
           });
         }
@@ -509,10 +515,26 @@ export class RecitationService {
       throw new NotFoundException('سجل التسميع غير موجود');
     }
 
-    await this.prisma.recitation.delete({
-      where: { id },
+    // Cascade: delete the recitation AND any points awarded for it,
+    // in a single transaction so we can never orphan points.
+    const result = await this.prisma.$transaction(async (tx) => {
+      const deletedPoints = await tx.pointsLog.deleteMany({
+        where: {
+          sourceType: 'RECITATION',
+          sourceId: id,
+        },
+      });
+
+      await tx.recitation.delete({ where: { id } });
+
+      return { deletedPointsCount: deletedPoints.count };
     });
 
-    return { message: 'تم حذف سجل التسميع بنجاح' };
+    return {
+      message:
+        result.deletedPointsCount > 0
+          ? `تم حذف التسميع وإلغاء ${result.deletedPointsCount} نقطة مرتبطة به`
+          : 'تم حذف التسميع بنجاح',
+    };
   }
 }

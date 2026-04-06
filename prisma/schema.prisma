@@ -141,6 +141,8 @@ model PointsLog {
   rating      RecitationRating?
   description String?
   awardedBy   String            @map("awarded_by")
+  sourceId    String?           @map("source_id")       // NEW
+  sourceType  String?           @map("source_type")     // NEW
   createdAt   DateTime          @default(now()) @map("created_at")
 
   student  Student       @relation(fields: [studentId], references: [id])
@@ -151,6 +153,7 @@ model PointsLog {
   @@index([studentId, categoryId])
   @@index([createdAt])
   @@index([awardedBy])
+  @@index([sourceType, sourceId])                       // NEW
   @@map("points_log")
 }
 
