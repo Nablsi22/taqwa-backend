@@ -428,7 +428,7 @@ export class StudentsService {
    * requires a confirmation token in the request body to prevent
    * accidental invocation.
    */
-  async regenerateAllCredentials(): Promise<{
+ async regenerateAllCredentials(): Promise<{
     message: string;
     count: number;
     credentials: Array<{
@@ -467,7 +467,7 @@ export class StudentsService {
           }),
         ),
       );
-    } catch (err) {
+    } catch (err: any) {
       console.error('[regenerateAll] phase 1 (parking) failed:', err);
       throw new BadRequestException(
         `فشل المرحلة الأولى من التحديث: ${err?.message || err}`,
@@ -520,7 +520,7 @@ export class StudentsService {
           phone2: student.phone2,
           instructorName: student.instructor.fullName,
         });
-      } catch (err) {
+      } catch (err: any) {
         console.error(
           `[regenerateAll] failed for student ${student.id} (${student.fullName}):`,
           err,
