@@ -20,7 +20,6 @@ export class StudentsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async create(dto: CreateStudentDto, createdByUserId: string) {
-    // Verify instructor exists
     const instructor = await this.prisma.instructor.findUnique({
       where: { id: dto.instructorId },
     });
@@ -30,9 +29,6 @@ export class StudentsService {
 
     const dob = new Date(dto.dateOfBirth);
 
-    // Auto-generate username (YYYYNNNN) and a strong random password.
-    // The plain password is returned to the caller ONCE so the admin
-    // can distribute it; it is never stored anywhere except as a bcrypt hash.
     const { username, plainPassword, passwordHash } =
       await generateCredentials(this.prisma, dob);
 
@@ -66,9 +62,6 @@ export class StudentsService {
       },
     });
 
-    // ⚠️ The plain password is returned ONCE in this response.
-    // The Flutter app must show it to the admin immediately and never
-    // request it again — there's no endpoint to retrieve it later.
     return {
       ...student,
       generatedCredentials: {
@@ -87,7 +80,6 @@ export class StudentsService {
   }) {
     const { search, instructorId, all = false } = params || {};
     const page = Math.max(1, params?.page ?? 1);
-    // Raised default from 20 → 50. Hard cap at 500 to protect the server.
     const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
     const skip = (page - 1) * limit;
 
@@ -106,8 +98,6 @@ export class StudentsService {
       where.instructorId = instructorId;
     }
 
-    // When `all=true` the client explicitly opts out of pagination.
-    // Still cap at 2000 to avoid accidental OOM.
     const findManyArgs: Prisma.StudentFindManyArgs = {
       where,
       orderBy: { fullName: 'asc' },
@@ -126,11 +116,6 @@ export class StudentsService {
       this.prisma.student.count({ where }),
     ]);
 
-    // --- Performance fix: single aggregated query instead of N+1 ---
-    // Previous code ran one aggregate() per student. For 100 students
-    // that was 100 extra round-trips. We now fetch all sums in one
-    // groupBy, split by category type so EARN and SPEND can be netted
-    // the same way findOne() does it.
     const studentIds = students.map((s) => s.id);
 
     const pointsGrouped = studentIds.length
@@ -141,7 +126,6 @@ export class StudentsService {
         })
       : [];
 
-    // We also need each category's type (EARN/SPEND) to net correctly.
     const categoryIds = [
       ...new Set(pointsGrouped.map((g) => g.categoryId)),
     ];
@@ -268,8 +252,6 @@ export class StudentsService {
   }
 
   async resetPassword(id: string, _ignoredManualPassword?: string) {
-    // Note: the second parameter used to be a manually-provided password.
-    // We now ignore it and always generate a strong random one for security.
     const student = await this.prisma.student.findUnique({
       where: { id },
       select: { userId: true, fullName: true },
@@ -291,7 +273,6 @@ export class StudentsService {
       }),
     ]);
 
-    // Plain password returned ONCE — same security model as create().
     return {
       message: 'تم إنشاء كلمة مرور جديدة',
       newPassword: plainPassword,
@@ -335,10 +316,6 @@ export class StudentsService {
   // CREDENTIALS MANAGEMENT — admin-only
   // ═══════════════════════════════════════════════════════════════
 
-  /**
-   * List every student with credential metadata for the admin
-   * credentials screen. Does NOT return passwords (we don't have them).
-   */
   async listCredentials(params?: {
     search?: string;
     sentFilter?: 'all' | 'sent' | 'unsent';
@@ -396,10 +373,6 @@ export class StudentsService {
     };
   }
 
-  /**
-   * Mark a student's credentials as having been sent to the parent.
-   * Called by Flutter after the admin confirms the WhatsApp send.
-   */
   async markCredentialsSent(id: string) {
     const student = await this.prisma.student.findUnique({
       where: { id },
@@ -418,17 +391,104 @@ export class StudentsService {
   }
 
   /**
-   * One-time bulk regeneration of every student's credentials.
-   * This is the migration helper for moving from the old manual scheme
-   * to the new YYYYNNNN system. Returns ALL plain passwords ONCE so the
-   * caller can immediately save them to an Excel file. After this call
-   * returns, the passwords are gone forever.
-   *
-   * Idempotency safety: this endpoint is dangerous. The controller
-   * requires a confirmation token in the request body to prevent
-   * accidental invocation.
+   * ONE-TIME RECOVERY: clean up parked tmp_<uuid> usernames left over
+   * from a failed bulk regeneration. Assigns proper YYYYNNNN usernames
+   * based on each student's birth year. Does NOT touch passwords.
    */
- async regenerateAllCredentials(): Promise<{
+  async recoverParkedUsernames(): Promise<{
+    message: string;
+    fixed: number;
+    mapping: Array<{
+      studentName: string;
+      oldUsername: string;
+      newUsername: string;
+    }>;
+  }> {
+    const parked = await this.prisma.student.findMany({
+      where: {
+        deletedAt: null,
+        user: { username: { startsWith: 'tmp_' } },
+      },
+      orderBy: [{ dateOfBirth: 'asc' }, { fullName: 'asc' }],
+      include: { user: true },
+    });
+
+    if (parked.length === 0) {
+      return { message: 'لا يوجد طلاب لإصلاحهم', fixed: 0, mapping: [] };
+    }
+
+    // For each year, find the highest existing YYYYNNNN number so we
+    // start counting from there (prevents collisions with the few
+    // students who already have proper usernames).
+    const yearStartCounters = new Map<number, number>();
+    const years = [
+      ...new Set(parked.map((s) => s.dateOfBirth.getFullYear())),
+    ];
+
+    for (const year of years) {
+      const prefix = year.toString();
+      const existing = await this.prisma.user.findMany({
+        where: {
+          username: { startsWith: prefix },
+          NOT: { username: { startsWith: 'tmp_' } },
+        },
+        select: { username: true },
+      });
+
+      let maxSeq = 0;
+      for (const u of existing) {
+        if (u.username.length === 8) {
+          const tail = parseInt(u.username.slice(4), 10);
+          if (!isNaN(tail) && tail > maxSeq) maxSeq = tail;
+        }
+      }
+      yearStartCounters.set(year, maxSeq);
+    }
+
+    const mapping: Array<{
+      studentName: string;
+      oldUsername: string;
+      newUsername: string;
+    }> = [];
+
+    for (const student of parked) {
+      const year = student.dateOfBirth.getFullYear();
+      const next = (yearStartCounters.get(year) ?? 0) + 1;
+      yearStartCounters.set(year, next);
+
+      const newUsername = `${year}${next.toString().padStart(4, '0')}`;
+      const oldUsername = student.user.username;
+
+      try {
+        await this.prisma.user.update({
+          where: { id: student.userId },
+          data: { username: newUsername },
+        });
+
+        mapping.push({
+          studentName: student.fullName,
+          oldUsername,
+          newUsername,
+        });
+      } catch (err: any) {
+        console.error(
+          `[recoverParkedUsernames] failed for ${student.fullName}:`,
+          err,
+        );
+        throw new BadRequestException(
+          `فشل إصلاح الطالب ${student.fullName}: ${err?.message || err}`,
+        );
+      }
+    }
+
+    return {
+      message: `تم إصلاح ${mapping.length} طالب`,
+      fixed: mapping.length,
+      mapping,
+    };
+  }
+
+  async regenerateAllCredentials(): Promise<{
     message: string;
     count: number;
     credentials: Array<{
@@ -454,10 +514,6 @@ export class StudentsService {
       return { message: 'لا يوجد طلاب', count: 0, credentials: [] };
     }
 
-    // ─── PHASE 1: Park all student usernames in a temporary unique
-    // namespace to avoid ANY collision when assigning new ones.
-    // We use the user's UUID (always unique) prefixed with "tmp_".
-    // ─────────────────────────────────────────────────────────────
     try {
       await this.prisma.$transaction(
         students.map((s) =>
@@ -474,7 +530,6 @@ export class StudentsService {
       );
     }
 
-    // ─── PHASE 2: Assign final YYYYNNNN usernames + new passwords ───
     const results: Array<{
       studentId: string;
       fullName: string;

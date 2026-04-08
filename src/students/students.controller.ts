@@ -50,12 +50,9 @@ export class StudentsController {
 
   // ═══════════════════════════════════════════════════════════════
   // CREDENTIALS MANAGEMENT — admin-only
-  // IMPORTANT: these routes must be declared BEFORE any `:id` route
-  // because NestJS matches routes in declaration order. Otherwise
-  // `credentials` would be parsed as a UUID and fail.
+  // STATIC ROUTES MUST COME BEFORE :id ROUTES
   // ═══════════════════════════════════════════════════════════════
 
-  // GET /api/v1/students/credentials/list
   @Get('credentials/list')
   @Roles('ADMIN')
   listCredentials(
@@ -65,8 +62,6 @@ export class StudentsController {
     return this.studentsService.listCredentials({ search, sentFilter });
   }
 
-  // POST /api/v1/students/credentials/regenerate-all
-  // Dangerous! Requires explicit confirmation token in body.
   @Post('credentials/regenerate-all')
   @Roles('ADMIN')
   regenerateAll(@Body('confirmationToken') token: string) {
@@ -76,6 +71,17 @@ export class StudentsController {
       );
     }
     return this.studentsService.regenerateAllCredentials();
+  }
+
+  // ⚠️ ONE-TIME RECOVERY ENDPOINT — remove after use.
+  // Cleans up tmp_<uuid> usernames left over from a failed bulk regen.
+  @Post('credentials/recover-parked')
+  @Roles('ADMIN')
+  recoverParked(@Body('confirmationToken') token: string) {
+    if (token !== 'RECOVER_PARKED_USERNAMES_CONFIRMED') {
+      throw new BadRequestException('رمز التأكيد غير صحيح');
+    }
+    return this.studentsService.recoverParkedUsernames();
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -103,15 +109,12 @@ export class StudentsController {
     return this.studentsService.update(id, dto);
   }
 
-  // POST /api/v1/students/:id/reset-password
-  // Generates a fresh random password — the admin no longer chooses it.
   @Post(':id/reset-password')
   @Roles('ADMIN')
   resetPassword(@Param('id', ParseUUIDPipe) id: string) {
     return this.studentsService.resetPassword(id);
   }
 
-  // POST /api/v1/students/:id/mark-credentials-sent
   @Post(':id/mark-credentials-sent')
   @Roles('ADMIN')
   markCredentialsSent(@Param('id', ParseUUIDPipe) id: string) {
