@@ -25,7 +25,7 @@ export class PointsController {
 
   /**
    * GET /api/v1/points/categories
-   * Get all active point categories
+   * Get all active point categories (legacy — kept for compat)
    */
   @Get('categories')
   @Roles('ADMIN', 'INSTRUCTOR')
@@ -34,13 +34,39 @@ export class PointsController {
   }
 
   /**
-   * POST /api/v1/points/award
-   * Award points to a student
+   * POST /api/v1/points/award (LEGACY)
+   * Old endpoint that takes a categoryId. Kept so existing app
+   * builds keep working until everyone updates. New clients
+   * should use POST /points/manual instead.
    */
   @Post('award')
   @Roles('ADMIN', 'INSTRUCTOR')
   award(@Body() dto: AwardPointsDto, @Request() req: any) {
     return this.pointsService.awardPoints(dto, req.user.id);
+  }
+
+  /**
+   * POST /api/v1/points/manual (NEW)
+   * Single entry point for instructor manual point awards.
+   *
+   * Two modes:
+   *   1. Rule-based:  { studentId, ruleId }
+   *      Amount and description come from the rule. Locked.
+   *   2. Custom:      { studentId, amount, reason }
+   *      Free amount, REQUIRED reason. Sign of amount = earn/deduct.
+   */
+  @Post('manual')
+  @Roles('ADMIN', 'INSTRUCTOR')
+  awardManual(@Body() body: any, @Request() req: any) {
+    return this.pointsService.awardManualPoints(
+      {
+        studentId: body?.studentId,
+        ruleId: body?.ruleId,
+        amount: body?.amount,
+        reason: body?.reason,
+      },
+      req.user.id,
+    );
   }
 
   /**
@@ -62,7 +88,6 @@ export class PointsController {
 
   /**
    * GET /api/v1/points/leaderboard
-   * Get leaderboard ranked by total points
    */
   @Get('leaderboard')
   @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT')
@@ -78,13 +103,16 @@ export class PointsController {
 
   /**
    * DELETE /api/v1/points/log/:id
-   * Delete a points log entry
    */
   @Delete('log/:id')
   @Roles('ADMIN')
   deleteLog(@Param('id', ParseUUIDPipe) id: string) {
     return this.pointsService.deleteLog(id);
   }
+
+  /**
+   * PUT /api/v1/points/categories/:id
+   */
   @Put('categories/:id')
   @Roles('ADMIN')
   updateCategory(
