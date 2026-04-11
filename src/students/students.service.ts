@@ -280,13 +280,42 @@ export class StudentsService {
     };
   }
 
-  async remove(id: string) {
-    await this.findOne(id);
-    return this.prisma.student.update({
+ async remove(id: string) {
+  const student = await this.prisma.student.findUnique({
+    where: { id },
+    select: { id: true, userId: true, fullName: true, deletedAt: true },
+  });
+
+  if (!student) {
+    throw new NotFoundException('الطالب غير موجود');
+  }
+
+  if (student.deletedAt) {
+    return { message: 'الطالب محذوف مسبقاً', alreadyDeleted: true };
+  }
+
+  // Soft-delete the student AND deactivate the user account in one transaction
+  // so they can't log in, their FCM token is cleared, and stale sessions die.
+  await this.prisma.$transaction([
+    this.prisma.student.update({
       where: { id },
       data: { deletedAt: new Date() },
-    });
-  }
+    }),
+    this.prisma.user.update({
+      where: { id: student.userId },
+      data: {
+        isActive: false,
+        fcmToken: null,
+      },
+    }),
+  ]);
+
+  return {
+    message: 'تم حذف الطالب بنجاح',
+    studentId: id,
+    studentName: student.fullName,
+  };
+}
 
   async getStudentStats(id: string) {
     const student = await this.findOne(id);
@@ -311,6 +340,26 @@ export class StudentsService {
       pointsByCategory,
     };
   }
+
+  async debugFindById(id: string) {
+  const student = await this.prisma.student.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      fullName: true,
+      deletedAt: true,
+      userId: true,
+      user: {
+        select: {
+          username: true,
+          isActive: true,
+          fcmToken: true,
+        },
+      },
+    },
+  });
+  return student ?? { error: 'Student not found in database' };
+}
 
   // ═══════════════════════════════════════════════════════════════
   // CREDENTIALS MANAGEMENT — admin-only

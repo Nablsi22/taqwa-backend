@@ -30,6 +30,12 @@ export class StudentsController {
     return this.studentsService.create(dto, req.user.id);
   }
 
+  @Get('debug/:id')
+  @Roles('ADMIN')
+  async debugFindById(@Param('id') id: string) {
+    return this.studentsService.debugFindById(id);
+  }
+
   @Get()
   @Roles('ADMIN', 'INSTRUCTOR')
   findAll(
