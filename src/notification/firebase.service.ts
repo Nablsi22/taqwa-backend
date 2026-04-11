@@ -1,59 +1,115 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as admin from 'firebase-admin';
-import * as path from 'path';
 import * as fs from 'fs';
+import * as path from 'path';
 
 @Injectable()
 export class FirebaseService implements OnModuleInit {
   private readonly logger = new Logger(FirebaseService.name);
+  private initialized = false;
 
   onModuleInit() {
+    this.initialize();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // INITIALIZATION
+  // Priority order:
+  //   1. FIREBASE_SERVICE_ACCOUNT env var (production / Railway)
+  //   2. firebase-admin-key.json file in backend root (local dev)
+  // ═══════════════════════════════════════════════════════════════════════════
+  private initialize() {
     if (admin.apps.length > 0) {
-      this.logger.log('Firebase already initialized');
-      return;
-    }
-
-    const keyPath = path.join(process.cwd(), 'firebase-admin-key.json');
-
-    if (!fs.existsSync(keyPath)) {
-      this.logger.warn(
-        'firebase-admin-key.json not found — push notifications disabled',
-      );
+      this.initialized = true;
       return;
     }
 
     try {
-      const serviceAccount = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+      const serviceAccount = this.loadServiceAccount();
+
+      if (!serviceAccount) {
+        this.logger.warn(
+          'Firebase service account not found — push notifications disabled',
+        );
+        return;
+      }
+
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
       });
+
+      this.initialized = true;
       this.logger.log('Firebase Admin SDK initialized successfully');
     } catch (error) {
-      this.logger.error('Failed to initialize Firebase:', error.message);
+      this.logger.error(
+        `Failed to initialize Firebase Admin SDK: ${error.message}`,
+      );
     }
   }
 
-  /**
-   * Send push notification to a single device
-   */
+  private loadServiceAccount(): admin.ServiceAccount | null {
+    // 1. Try environment variable (production)
+    const envValue = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (envValue && envValue.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(envValue);
+        this.logger.log(
+          'Loading Firebase credentials from FIREBASE_SERVICE_ACCOUNT env var',
+        );
+        return parsed as admin.ServiceAccount;
+      } catch (err) {
+        this.logger.error(
+          `FIREBASE_SERVICE_ACCOUNT env var is not valid JSON: ${err.message}`,
+        );
+        return null;
+      }
+    }
+
+    // 2. Fall back to local file (dev)
+    const filePath = path.join(process.cwd(), 'firebase-admin-key.json');
+    if (fs.existsSync(filePath)) {
+      try {
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        this.logger.log(
+          'Loading Firebase credentials from firebase-admin-key.json file',
+        );
+        return JSON.parse(fileContent) as admin.ServiceAccount;
+      } catch (err) {
+        this.logger.error(
+          `Failed to read firebase-admin-key.json: ${err.message}`,
+        );
+        return null;
+      }
+    }
+
+    this.logger.warn('firebase-admin-key.json not found and FIREBASE_SERVICE_ACCOUNT env var not set');
+    return null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SEND TO SINGLE DEVICE
+  // ═══════════════════════════════════════════════════════════════════════════
   async sendToDevice(
     token: string,
     title: string,
     body: string,
     data?: Record<string, string>,
   ): Promise<boolean> {
-    if (!admin.apps.length || !token) return false;
+    if (!this.initialized) {
+      this.logger.warn('Firebase not initialized — skipping send');
+      return false;
+    }
 
     try {
-      await admin.messaging().send({
+      const message: admin.messaging.Message = {
         token,
         notification: { title, body },
-        data: data || {},
+        data: data ?? {},
         android: {
           priority: 'high',
           notification: {
             sound: 'default',
-            channelId: 'taqwa_announcements',
+            channelId: 'taqwa_default',
           },
         },
         apns: {
@@ -64,33 +120,32 @@ export class FirebaseService implements OnModuleInit {
             },
           },
         },
-      });
-      this.logger.log(`Notification sent to token: ${token.substring(0, 20)}...`);
+      };
+
+      await admin.messaging().send(message);
       return true;
     } catch (error) {
-      this.logger.error(`Failed to send notification: ${error.message}`);
-      // If token is invalid, return false so caller can clean it up
-      if (
-        error.code === 'messaging/invalid-registration-token' ||
-        error.code === 'messaging/registration-token-not-registered'
-      ) {
-        return false;
-      }
+      this.logger.error(`Failed to send to device: ${error.message}`);
       return false;
     }
   }
 
-  /**
-   * Send push notification to multiple devices
-   */
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SEND TO MULTIPLE DEVICES (multicast)
+  // ═══════════════════════════════════════════════════════════════════════════
   async sendToMultipleDevices(
     tokens: string[],
     title: string,
     body: string,
     data?: Record<string, string>,
-  ): Promise<{ success: number; failure: number; invalidTokens: string[] }> {
-    if (!admin.apps.length || tokens.length === 0) {
-      return { success: 0, failure: 0, invalidTokens: [] };
+  ): Promise<{
+    success: number;
+    failure: number;
+    invalidTokens: string[];
+  }> {
+    if (!this.initialized) {
+      this.logger.warn('Firebase not initialized — skipping multicast');
+      return { success: 0, failure: tokens.length, invalidTokens: [] };
     }
 
     const validTokens = tokens.filter((t) => t && t.length > 0);
@@ -102,12 +157,12 @@ export class FirebaseService implements OnModuleInit {
       const message: admin.messaging.MulticastMessage = {
         tokens: validTokens,
         notification: { title, body },
-        data: data || {},
+        data: data ?? {},
         android: {
           priority: 'high',
           notification: {
             sound: 'default',
-            channelId: 'taqwa_announcements',
+            channelId: 'taqwa_default',
           },
         },
         apns: {
@@ -124,13 +179,14 @@ export class FirebaseService implements OnModuleInit {
 
       const invalidTokens: string[] = [];
       response.responses.forEach((resp, idx) => {
-        if (
-          !resp.success &&
-          resp.error &&
-          (resp.error.code === 'messaging/invalid-registration-token' ||
-            resp.error.code === 'messaging/registration-token-not-registered')
-        ) {
-          invalidTokens.push(validTokens[idx]);
+        if (!resp.success) {
+          const errorCode = resp.error?.code;
+          if (
+            errorCode === 'messaging/invalid-registration-token' ||
+            errorCode === 'messaging/registration-token-not-registered'
+          ) {
+            invalidTokens.push(validTokens[idx]);
+          }
         }
       });
 
