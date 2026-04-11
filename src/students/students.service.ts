@@ -341,25 +341,7 @@ export class StudentsService {
     };
   }
 
-  async debugFindById(id: string) {
-  const student = await this.prisma.student.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      fullName: true,
-      deletedAt: true,
-      userId: true,
-      user: {
-        select: {
-          username: true,
-          isActive: true,
-          fcmToken: true,
-        },
-      },
-    },
-  });
-  return student ?? { error: 'Student not found in database' };
-}
+ 
 
   // ═══════════════════════════════════════════════════════════════
   // CREDENTIALS MANAGEMENT — admin-only
