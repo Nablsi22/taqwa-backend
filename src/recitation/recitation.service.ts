@@ -414,7 +414,7 @@ export class RecitationService {
     instructorId = await this.resolveInstructorId(instructorId);
 
     const students = await this.prisma.student.findMany({
-      where: { instructorId },
+      where: { instructorId, deletedAt: null },
       include: { user: true },
     });
 
