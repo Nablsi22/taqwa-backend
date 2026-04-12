@@ -229,77 +229,74 @@ export class PointsService {
   // sourceType so admin and instructor screens render identically.
   // ═══════════════════════════════════════════════════════════════
   async getStudentPoints(
-    studentId: string,
-    params?: { page?: number; limit?: number },
-  ) {
-    const { page = 1, limit = 30 } = params || {};
-    const skip = (page - 1) * limit;
+  studentId: string,
+  params?: { page?: number; limit?: number },
+) {
+  const { page = 1, limit = 30 } = params || {};
+  const skip = (page - 1) * limit;
 
-    const student = await this.prisma.student.findUnique({
-      where: { id: studentId },
-    });
-    if (!student || student.deletedAt) {
-      throw new NotFoundException('الطالب غير موجود');
-    }
-
-    const [logs, total] = await Promise.all([
-      this.prisma.pointsLog.findMany({
-        where: { studentId },
-        include: {
-          category: { select: { name: true, nameAr: true, type: true } },
-        },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
-      this.prisma.pointsLog.count({ where: { studentId } }),
-    ]);
-
-    const totalPoints = await this.prisma.pointsLog.aggregate({
-      where: { studentId },
-      _sum: { amount: true },
-    });
-
-    return {
-      student: {
-        id: student.id,
-        fullName: student.fullName,
-      },
-      totalPoints: totalPoints._sum.amount || 0,
-      data: logs.map((log) => {
-        const sourceTypeKey = this.normalizeSourceType(log.sourceType);
-        const displayLabel = this.labelForSourceType(sourceTypeKey);
-        return {
-          id: log.id,
-          // Title shown in the UI = description (always meaningful).
-          // For MANUAL/rule rows: rule's nameAr.
-          // For MANUAL/custom rows: instructor's typed reason.
-          // For RECITATION/ATTENDANCE rows: rule name set by the
-          // recitation/attendance services.
-          description:
-            log.description ||
-            log.category?.nameAr ||
-            log.category?.name ||
-            '',
-          // Chip label shown above the description.
-          displayLabel,
-          sourceType: sourceTypeKey,
-          // Legacy fields kept so old clients still render something.
-          categoryName: log.category?.nameAr || log.category?.name || '',
-          categoryType: log.category?.type || null,
-          amount: log.amount,
-          rating: log.rating,
-          createdAt: log.createdAt,
-        };
-      }),
-      meta: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      },
-    };
+  const student = await this.prisma.student.findUnique({
+    where: { id: studentId },
+  });
+  if (!student || student.deletedAt) {
+    throw new NotFoundException('الطالب غير موجود');
   }
+
+  const [logs, total] = await Promise.all([
+    this.prisma.pointsLog.findMany({
+      where: { studentId },
+      include: {
+        category: { select: { name: true, nameAr: true, type: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit,
+    }),
+    this.prisma.pointsLog.count({ where: { studentId } }),
+  ]);
+
+  const totalPointsAgg = await this.prisma.pointsLog.aggregate({
+    where: { studentId },
+    _sum: { amount: true },
+  });
+
+  // ── FIX: coerce Decimal → number ──
+  const totalPointsNumber = Number(totalPointsAgg._sum.amount ?? 0);
+
+  return {
+    student: {
+      id: student.id,
+      fullName: student.fullName,
+    },
+    totalPoints: totalPointsNumber,
+    data: logs.map((log) => {
+      const sourceTypeKey = this.normalizeSourceType(log.sourceType);
+      const displayLabel = this.labelForSourceType(sourceTypeKey);
+      return {
+        id: log.id,
+        description:
+          log.description ||
+          log.category?.nameAr ||
+          log.category?.name ||
+          '',
+        displayLabel,
+        sourceType: sourceTypeKey,
+        categoryName: log.category?.nameAr || log.category?.name || '',
+        categoryType: log.category?.type || null,
+        // ── FIX: coerce Decimal → number ──
+        amount: Number(log.amount),
+        rating: log.rating,
+        createdAt: log.createdAt,
+      };
+    }),
+    meta: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+  };
+}
 
   /**
    * Normalize sourceType to one of the keys the UI expects.
