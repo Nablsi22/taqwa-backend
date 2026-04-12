@@ -272,72 +272,102 @@ export class RecitationService {
   // POINTS — LEGACY format (unchanged behavior)
   // ═══════════════════════════════════════════════════════════
 
-  private async applyRecitationPoints(
-    studentId: string,
-    instructorId: string,
-    rating: string,
-    pageCount: number,
-    sourceId: string,
-  ) {
-    try {
-      if (
-        rating === 'REPEAT' ||
-        rating === 'DID_NOT_MEMORIZE' ||
-        pageCount <= 0
-      ) {
-        return;
-      }
-
-      let pointResult: { points: number; ruleNameAr: string } | null = null;
-
-      if (rating === 'MAQRAA') {
-        const maqraaRule =
-          await this.pointRulesService.findByCode('RECITE_MAQRAA');
-        if (maqraaRule && maqraaRule.isActive) {
-          const pts = maqraaRule.isPerPage
-            ? maqraaRule.points * pageCount
-            : maqraaRule.points;
-          pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
-        }
-      } else {
-        pointResult = await this.pointRulesService.getRecitationPoints(
-          rating,
-          pageCount,
-        );
-      }
-
-      if (pointResult && pointResult.points !== 0) {
-        const category =
-          (await this.prisma.pointCategory.findFirst({
-            where: { name: { contains: 'Quran', mode: 'insensitive' } },
-          })) ||
-          (await this.prisma.pointCategory.findFirst({
-            where: { name: { contains: 'recitation', mode: 'insensitive' } },
-          })) ||
-          (await this.prisma.pointCategory.findFirst({
-            where: { name: { contains: 'Memorization', mode: 'insensitive' } },
-          })) ||
-          (await this.prisma.pointCategory.findFirst());
-
-        if (category) {
-          await this.prisma.pointsLog.create({
-            data: {
-              studentId,
-              categoryId: category.id,
-              amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
-              rating: rating as any,
-              description: pointResult.ruleNameAr,
-              awardedBy: instructorId,
-              sourceId,
-              sourceType: 'RECITATION',
-            },
-          });
-        }
-      }
-    } catch (error) {
-      console.error('Error applying recitation points:', error);
+ private async applyRecitationPoints(
+  studentId: string,
+  instructorId: string,
+  rating: string,
+  pageCount: number,
+  sourceId: string,
+) {
+  try {
+    if (
+      rating === 'REPEAT' ||
+      rating === 'DID_NOT_MEMORIZE' ||
+      pageCount <= 0
+    ) {
+      return;
     }
+
+    let pointResult: { points: number; ruleNameAr: string } | null = null;
+
+    if (rating === 'MAQRAA') {
+      const maqraaRule =
+        await this.pointRulesService.findByCode('RECITE_MAQRAA');
+      if (maqraaRule && maqraaRule.isActive) {
+        const rulePoints = Number(maqraaRule.points);
+        const pts = maqraaRule.isPerPage
+          ? rulePoints * pageCount
+          : rulePoints;
+        pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
+      }
+    } else {
+      const raw = await this.pointRulesService.getRecitationPoints(
+        rating,
+        pageCount,
+      );
+      if (raw) {
+        // Coerce in case rule.points is a Decimal
+        pointResult = {
+          points: Number(raw.points),
+          ruleNameAr: raw.ruleNameAr,
+        };
+      }
+    }
+
+    // ── Hard guard against NaN / null / zero ──
+    if (
+      !pointResult ||
+      pointResult.points === null ||
+      pointResult.points === undefined ||
+      isNaN(pointResult.points) ||
+      pointResult.points === 0
+    ) {
+      console.warn(
+        `[applyRecitationPoints] No points awarded — rating=${rating} pages=${pageCount} result=${JSON.stringify(pointResult)}`,
+      );
+      return;
+    }
+
+    const category =
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'Quran', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'recitation', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'Memorization', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'حفظ', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst());
+
+    if (!category) {
+      console.error('[applyRecitationPoints] No PointCategory found in DB');
+      return;
+    }
+
+    await this.prisma.pointsLog.create({
+      data: {
+        studentId,
+        categoryId: category.id,
+        amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
+        rating: rating as any,
+        description: pointResult.ruleNameAr,
+        awardedBy: instructorId,
+        sourceId,
+        sourceType: 'RECITATION',
+      },
+    });
+
+    console.log(
+      `[applyRecitationPoints] ✅ Awarded ${pointResult.points} pts to student ${studentId} for ${rating}`,
+    );
+  } catch (error) {
+    console.error('[applyRecitationPoints] ❌ Error:', error);
   }
+}
 
   // ═══════════════════════════════════════════════════════════
   // NEXT-AYA SUGGESTION
