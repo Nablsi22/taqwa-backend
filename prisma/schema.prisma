@@ -139,7 +139,7 @@ model PointsLog {
   id          String            @id @default(uuid())
   studentId   String            @map("student_id")
   categoryId  String            @map("category_id")
-  amount      Int
+  amount      Decimal  @db.Decimal(7, 3)
   rating      RecitationRating?
   description String?
   awardedBy   String            @map("awarded_by")
@@ -209,6 +209,13 @@ model Recitation {
   homework       String?
   date           DateTime         @db.Date
   createdAt      DateTime         @default(now()) @map("created_at")
+  startSurah        Int?
+  startAya          Int?
+  endSurah          Int?
+  endAya            Int?
+  startPage         Int?
+  endPage           Int?
+  pagesCalculated   Decimal? @db.Decimal(5, 3)
 
   student Student @relation(fields: [studentId], references: [id])
 
