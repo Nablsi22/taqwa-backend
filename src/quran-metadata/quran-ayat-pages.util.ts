@@ -8,7 +8,7 @@ import * as fs from 'fs';
 
 interface SurahJsonEntry {
   n: number;       // surah number 1..114
-  name: string;    // Arabic name (UTF-8)
+  name: string;    // Arabic name (UTF-8) — DO NOT trust this; use SURAH_NAMES_AR
   numAyas: number;
   firstAyahId: number;
   juzStart: number;
@@ -38,6 +38,26 @@ interface SurahMeta {
 }
 
 const TOTAL_QURAN_PAGES = 604;
+
+// ─── Hardcoded Arabic surah names (1..114) ───
+// The names in quran_ayat_pages.json are double-encoded mojibake from
+// the source generator, so we use this clean lookup instead.
+const SURAH_NAMES_AR: string[] = [
+  'الفاتحة', 'البقرة', 'آل عمران', 'النساء', 'المائدة', 'الأنعام', 'الأعراف',
+  'الأنفال', 'التوبة', 'يونس', 'هود', 'يوسف', 'الرعد', 'إبراهيم', 'الحجر', 'النحل',
+  'الإسراء', 'الكهف', 'مريم', 'طه', 'الأنبياء', 'الحج', 'المؤمنون', 'النور', 'الفرقان',
+  'الشعراء', 'النمل', 'القصص', 'العنكبوت', 'الروم', 'لقمان', 'السجدة', 'الأحزاب',
+  'سبأ', 'فاطر', 'يس', 'الصافات', 'ص', 'الزمر', 'غافر', 'فصلت', 'الشورى', 'الزخرف',
+  'الدخان', 'الجاثية', 'الأحقاف', 'محمد', 'الفتح', 'الحجرات', 'ق', 'الذاريات', 'الطور',
+  'النجم', 'القمر', 'الرحمن', 'الواقعة', 'الحديد', 'المجادلة', 'الحشر', 'الممتحنة',
+  'الصف', 'الجمعة', 'المنافقون', 'التغابن', 'الطلاق', 'التحريم', 'الملك', 'القلم',
+  'الحاقة', 'المعارج', 'نوح', 'الجن', 'المزمل', 'المدثر', 'القيامة', 'الإنسان',
+  'المرسلات', 'النبأ', 'النازعات', 'عبس', 'التكوير', 'الانفطار', 'المطففين', 'الانشقاق',
+  'البروج', 'الطارق', 'الأعلى', 'الغاشية', 'الفجر', 'البلد', 'الشمس', 'الليل', 'الضحى',
+  'الشرح', 'التين', 'العلق', 'القدر', 'البينة', 'الزلزلة', 'العاديات', 'القارعة',
+  'التكاثر', 'العصر', 'الهمزة', 'الفيل', 'قريش', 'الماعون', 'الكوثر', 'الكافرون',
+  'النصر', 'المسد', 'الإخلاص', 'الفلق', 'الناس',
+];
 
 // ─── Load JSON once at module init ───
 function loadQuranJson(): QuranJson {
@@ -75,7 +95,7 @@ for (const s of QURAN.surahs) {
 
   SURAH_META_BY_NUMBER.set(s.n, {
     number: s.n,
-    nameAr: s.name,
+    nameAr: SURAH_NAMES_AR[s.n - 1] ?? `سورة ${s.n}`,
     numAyas: s.numAyas,
     startPage: minPage,
     endPage: maxPage,
