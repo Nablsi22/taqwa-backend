@@ -7,6 +7,7 @@ import {
   IsDateString,
   IsArray,
   ArrayMinSize,
+  ValidateIf,
   Min,
   Max,
 } from 'class-validator';
@@ -23,22 +24,36 @@ export class CreateRecitationDto {
   @IsString()
   studentId: string;
 
-  /**
-   * Array of surah numbers selected by the instructor.
-   * Always at least 1. For single-surah entries the array has one element;
-   * for multi-surah entries (e.g. several short surahs in Juz 30) it has many.
-   */
+  // ───── LEGACY fields (Phase 1, kept optional for backward compat) ─────
+  @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
   @IsInt({ each: true })
   @Min(1, { each: true })
   @Max(114, { each: true })
-  surahNumbers: number[];
+  surahNumbers?: number[];
 
+  @IsOptional()
   @IsNumber()
   @Min(0)
-  pagesRecited: number;
+  pagesRecited?: number;
 
+  // ───── NEW Phase 2B aya-range fields ─────
+  @IsOptional() @IsInt() @Min(1) @Max(114)
+  startSurah?: number;
+
+  @ValidateIf((o) => o.startSurah !== undefined)
+  @IsInt() @Min(1)
+  startAya?: number;
+
+  @IsOptional() @IsInt() @Min(1) @Max(114)
+  endSurah?: number;
+
+  @ValidateIf((o) => o.startAya !== undefined)
+  @IsInt() @Min(1)
+  endAya?: number;
+
+  // ───── Common ─────
   @IsEnum(RecitationRatingDto)
   rating: RecitationRatingDto;
 
@@ -54,14 +69,10 @@ export class BulkMaqraaDto {
   @IsString({ each: true })
   studentIds: string[];
 
-  @IsInt()
-  @Min(1)
-  @Max(114)
+  @IsInt() @Min(1) @Max(114)
   surahNumber: number;
 
-  @IsNumber()
-  @Min(0)
-  @IsOptional()
+  @IsNumber() @Min(0) @IsOptional()
   pagesRecited?: number;
 
   @IsDateString()

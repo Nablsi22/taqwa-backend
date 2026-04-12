@@ -355,7 +355,7 @@ export class PointsService {
         id: s.id,
         fullName: s.fullName,
         instructorName: s.instructor.fullName,
-        totalPoints: s.pointsLog.reduce((sum, p) => sum + p.amount, 0),
+        totalPoints: s.pointsLog.reduce((sum, p) => sum + Number(p.amount), 0),
       }))
       .sort((a, b) => b.totalPoints - a.totalPoints)
       .slice(0, limit)

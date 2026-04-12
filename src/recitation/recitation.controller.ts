@@ -51,6 +51,17 @@ export class RecitationController {
     return this.recitationService.getInstructorOverview(instructorId);
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // NEW (Phase 2B) — Suggest the next aya for a student
+  // MUST be declared before any `student/:id/...` route to avoid
+  // route-matching conflicts (NestJS matches top-to-bottom).
+  // ─────────────────────────────────────────────────────────────
+  @Get('student/:id/next-suggestion')
+  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
+  async getNextSuggestion(@Param('id') studentId: string) {
+    return this.recitationService.getNextSuggestion(studentId);
+  }
+
   // GET /recitations/student/:id/progress — Full memorization map
   @Get('student/:id/progress')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')

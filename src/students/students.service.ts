@@ -141,7 +141,8 @@ export class StudentsService {
 
     const totalsByStudent = new Map<string, number>();
     for (const row of pointsGrouped) {
-      const amount = row._sum.amount ?? 0;
+      // ─── FIX: Decimal → number conversion ───
+      const amount = Number(row._sum.amount ?? 0);
       const type = categoryTypeById.get(row.categoryId);
       const signed = type === 'DEDUCT' ? -amount : amount;
       totalsByStudent.set(
@@ -191,8 +192,10 @@ export class StudentsService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
+    // ─── FIX: Decimal → number conversion ───
     const totalPoints = student.pointsLog.reduce((sum: number, p) => {
-      return p.category.type === 'EARN' ? sum + p.amount : sum - p.amount;
+      const amt = Number(p.amount);
+      return p.category.type === 'EARN' ? sum + amt : sum - amt;
     }, 0);
 
     return { ...student, totalPoints };
@@ -280,42 +283,40 @@ export class StudentsService {
     };
   }
 
- async remove(id: string) {
-  const student = await this.prisma.student.findUnique({
-    where: { id },
-    select: { id: true, userId: true, fullName: true, deletedAt: true },
-  });
-
-  if (!student) {
-    throw new NotFoundException('الطالب غير موجود');
-  }
-
-  if (student.deletedAt) {
-    return { message: 'الطالب محذوف مسبقاً', alreadyDeleted: true };
-  }
-
-  // Soft-delete the student AND deactivate the user account in one transaction
-  // so they can't log in, their FCM token is cleared, and stale sessions die.
-  await this.prisma.$transaction([
-    this.prisma.student.update({
+  async remove(id: string) {
+    const student = await this.prisma.student.findUnique({
       where: { id },
-      data: { deletedAt: new Date() },
-    }),
-    this.prisma.user.update({
-      where: { id: student.userId },
-      data: {
-        isActive: false,
-        fcmToken: null,
-      },
-    }),
-  ]);
+      select: { id: true, userId: true, fullName: true, deletedAt: true },
+    });
 
-  return {
-    message: 'تم حذف الطالب بنجاح',
-    studentId: id,
-    studentName: student.fullName,
-  };
-}
+    if (!student) {
+      throw new NotFoundException('الطالب غير موجود');
+    }
+
+    if (student.deletedAt) {
+      return { message: 'الطالب محذوف مسبقاً', alreadyDeleted: true };
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.student.update({
+        where: { id },
+        data: { deletedAt: new Date() },
+      }),
+      this.prisma.user.update({
+        where: { id: student.userId },
+        data: {
+          isActive: false,
+          fcmToken: null,
+        },
+      }),
+    ]);
+
+    return {
+      message: 'تم حذف الطالب بنجاح',
+      studentId: id,
+      studentName: student.fullName,
+    };
+  }
 
   async getStudentStats(id: string) {
     const student = await this.findOne(id);
@@ -340,8 +341,6 @@ export class StudentsService {
       pointsByCategory,
     };
   }
-
- 
 
   // ═══════════════════════════════════════════════════════════════
   // CREDENTIALS MANAGEMENT — admin-only
@@ -421,11 +420,6 @@ export class StudentsService {
     return { message: 'تم تسجيل إرسال البيانات' };
   }
 
-  /**
-   * ONE-TIME RECOVERY: clean up parked tmp_<uuid> usernames left over
-   * from a failed bulk regeneration. Assigns proper YYYYNNNN usernames
-   * based on each student's birth year. Does NOT touch passwords.
-   */
   async recoverParkedUsernames(): Promise<{
     message: string;
     fixed: number;
@@ -448,9 +442,6 @@ export class StudentsService {
       return { message: 'لا يوجد طلاب لإصلاحهم', fixed: 0, mapping: [] };
     }
 
-    // For each year, find the highest existing YYYYNNNN number so we
-    // start counting from there (prevents collisions with the few
-    // students who already have proper usernames).
     const yearStartCounters = new Map<number, number>();
     const years = [
       ...new Set(parked.map((s) => s.dateOfBirth.getFullYear())),
