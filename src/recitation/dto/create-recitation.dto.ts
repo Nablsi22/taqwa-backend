@@ -20,11 +20,13 @@ export enum RecitationRatingDto {
   MAQRAA = 'MAQRAA',
 }
 
+// ═══════════════════════════════════════════════════════════
+// LEGACY single-segment DTO (still used by old endpoint)
+// ═══════════════════════════════════════════════════════════
 export class CreateRecitationDto {
   @IsString()
   studentId: string;
 
-  // ───── LEGACY fields (Phase 1, kept optional for backward compat) ─────
   @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
@@ -38,7 +40,6 @@ export class CreateRecitationDto {
   @Min(0)
   pagesRecited?: number;
 
-  // ───── NEW Phase 2B aya-range fields ─────
   @IsOptional() @IsInt() @Min(1) @Max(114)
   startSurah?: number;
 
@@ -53,7 +54,6 @@ export class CreateRecitationDto {
   @IsInt() @Min(1)
   endAya?: number;
 
-  // ───── Common ─────
   @IsEnum(RecitationRatingDto)
   rating: RecitationRatingDto;
 
@@ -65,6 +65,38 @@ export class CreateRecitationDto {
   date: string;
 }
 
+// ═══════════════════════════════════════════════════════════
+// NEW — multi-segment batch DTO (mixed full-sura + aya-range)
+// ═══════════════════════════════════════════════════════════
+//
+// Each segment is either:
+//   { type: 'FULL_SURA', surahNumbers: [89, 90] }
+//   { type: 'AYA_RANGE', startSurah: 89, startAya: 1, endAya: 15 }
+//
+// Validated shallowly here; deep shape-validation happens in the service
+// so we can return Arabic error messages consistent with the rest of the API.
+//
+export class CreateRecitationBatchDto {
+  @IsString()
+  studentId: string;
+
+  @IsDateString()
+  date: string;
+
+  @IsEnum(RecitationRatingDto)
+  rating: RecitationRatingDto;
+
+  @IsString()
+  @IsOptional()
+  homework?: string;
+
+  @IsArray()
+  segments: any[];
+}
+
+// ═══════════════════════════════════════════════════════════
+// BULK MAQRAA — unchanged
+// ═══════════════════════════════════════════════════════════
 export class BulkMaqraaDto {
   @IsString({ each: true })
   studentIds: string[];

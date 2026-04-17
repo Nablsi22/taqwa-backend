@@ -7,6 +7,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   CreateRecitationDto,
+  CreateRecitationBatchDto,
   BulkMaqraaDto,
 } from './dto/create-recitation.dto';
 import { PointRulesService } from '../point-rules/point-rules.service';
@@ -52,8 +53,59 @@ export class RecitationService {
     return [rec.surahNumber];
   }
 
+  /**
+   * Compose a timestamp that carries the RECITATION's calendar date
+   * (what the teacher selected) plus the CURRENT time-of-day (when
+   * the record was actually entered).
+   *
+   * Why: when the instructor back-fills yesterday's recitation today,
+   * the corresponding PointsLog row must display yesterday's date in
+   * the student's points history — but two back-fills submitted right
+   * now for the same past day should still sort by entry order.
+   *
+   * Parse YYYY-MM-DD manually (avoids `new Date("2025-04-10")` UTC
+   * midnight shifting a day in negative-offset timezones).
+   */
+  private composePointsCreatedAt(dateStr: string): Date {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const now = new Date();
+    return new Date(
+      y,
+      m - 1,
+      d,
+      now.getHours(),
+      now.getMinutes(),
+      now.getSeconds(),
+      now.getMilliseconds(),
+    );
+  }
+
+  /**
+   * Resolve the PointCategory used for all recitation-sourced points.
+   * Fallback chain kept identical to the prior inline logic to avoid
+   * any behavior change for existing deployments.
+   */
+  private async findRecitationCategory() {
+    return (
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'Quran', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'recitation', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'Memorization', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst({
+        where: { name: { contains: 'حفظ', mode: 'insensitive' } },
+      })) ||
+      (await this.prisma.pointCategory.findFirst())
+    );
+  }
+
   // ═══════════════════════════════════════════════════════════
-  // CREATE — handles BOTH new aya-range and legacy formats
+  // CREATE — legacy single-recitation endpoint (UNCHANGED behavior
+  // except points.createdAt now mirrors the recitation date)
   // ═══════════════════════════════════════════════════════════
 
   async create(dto: CreateRecitationDto, instructorId: string) {
@@ -64,10 +116,11 @@ export class RecitationService {
     });
     if (!student) throw new NotFoundException('الطالب غير موجود');
 
+    const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
+
     const isNewFormat =
       dto.startSurah !== undefined && dto.startAya !== undefined;
 
-    // ════════════════ NEW aya-range path ════════════════
     if (isNewFormat) {
       const startSurah = dto.startSurah!;
       const endSurah = dto.endSurah ?? startSurah;
@@ -88,9 +141,9 @@ export class RecitationService {
         data: {
           studentId: dto.studentId,
           instructorId,
-          surahNumber: startSurah,         // legacy mirror
-          surahNumbers: [startSurah],      // legacy mirror
-          pagesRecited: Math.max(1, Math.round(pages)), // legacy int mirror
+          surahNumber: startSurah,
+          surahNumbers: [startSurah],
+          pagesRecited: Math.max(1, Math.round(pages)),
           isCompleteSura:
             startAya === 1 && endAya >= surahMeta.numAyas,
           rating: dto.rating,
@@ -110,6 +163,7 @@ export class RecitationService {
         dto.rating,
         pages,
         recitation.id,
+        pointsCreatedAt,
       );
 
       return {
@@ -119,7 +173,7 @@ export class RecitationService {
       };
     }
 
-    // ════════════════ LEGACY multi-surah path ════════════════
+    // ── Legacy multi-surah path ──
     if (!dto.surahNumbers || dto.surahNumbers.length === 0) {
       throw new BadRequestException('surahNumbers مطلوب');
     }
@@ -164,6 +218,7 @@ export class RecitationService {
       dto.rating,
       pagesRecited,
       recitation.id,
+      pointsCreatedAt,
     );
 
     const suraNames = dto.surahNumbers.map((n) => getSuraName(n));
@@ -176,7 +231,200 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // BULK MAQRAA — unchanged
+  // CREATE BATCH — multi-segment session (NEW)
+  //
+  // Each segment becomes its own Recitation row (clean progress-
+  // tracking semantics), all inserted in a single transaction. One
+  // combined PointsLog is created for the total pages across all
+  // segments and attached (via sourceId) to the first recitation.
+  // ═══════════════════════════════════════════════════════════
+
+  async createBatch(
+    dto: CreateRecitationBatchDto,
+    instructorId: string,
+  ) {
+    instructorId = await this.resolveInstructorId(instructorId);
+
+    const student = await this.prisma.student.findUnique({
+      where: { id: dto.studentId },
+    });
+    if (!student) throw new NotFoundException('الطالب غير موجود');
+
+    const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
+    const recitationDate = new Date(dto.date);
+
+    const isNoMemorize = dto.rating === 'DID_NOT_MEMORIZE';
+
+    // ── DID_NOT_MEMORIZE: placeholder row, no segments, no points ──
+    if (isNoMemorize) {
+      const placeholder = await this.prisma.recitation.create({
+        data: {
+          studentId: dto.studentId,
+          instructorId,
+          surahNumber: 1,
+          surahNumbers: [1],
+          pagesRecited: 0,
+          isCompleteSura: false,
+          rating: dto.rating,
+          homework: dto.homework || null,
+          date: recitationDate,
+          startSurah: 1,
+          startAya: 1,
+          endSurah: 1,
+          endAya: 1,
+          pagesCalculated: new Prisma.Decimal(0),
+        },
+      });
+      return {
+        data: [placeholder],
+        count: 1,
+        totalPages: 0,
+        message: 'تم تسجيل التسميع بنجاح',
+      };
+    }
+
+    // ── Validate all segments up front — fail the entire batch early ──
+    if (!Array.isArray(dto.segments) || dto.segments.length === 0) {
+      throw new BadRequestException('يجب إضافة مقطع واحد على الأقل');
+    }
+
+    for (const [idx, seg] of dto.segments.entries()) {
+      const pos = idx + 1;
+      if (!seg || typeof seg !== 'object') {
+        throw new BadRequestException(`المقطع ${pos} غير صالح`);
+      }
+
+      if (seg.type === 'FULL_SURA') {
+        if (!Array.isArray(seg.surahNumbers) || seg.surahNumbers.length === 0) {
+          throw new BadRequestException(
+            `المقطع ${pos}: يجب اختيار سورة واحدة على الأقل`,
+          );
+        }
+        for (const n of seg.surahNumbers) {
+          if (typeof n !== 'number' || !getSuraByNumber(n)) {
+            throw new BadRequestException(
+              `المقطع ${pos}: رقم السورة غير صالح: ${n}`,
+            );
+          }
+        }
+      } else if (seg.type === 'AYA_RANGE') {
+        const s = seg.startSurah;
+        const sa = seg.startAya;
+        const ea = seg.endAya;
+        if (typeof s !== 'number' || typeof sa !== 'number' || typeof ea !== 'number') {
+          throw new BadRequestException(
+            `المقطع ${pos}: بيانات نطاق الآيات غير كاملة`,
+          );
+        }
+        const v = validateRange(s, sa, s, ea);
+        if (!v.valid) {
+          throw new BadRequestException(`المقطع ${pos}: ${v.error}`);
+        }
+      } else {
+        throw new BadRequestException(
+          `المقطع ${pos}: نوع غير معروف (${seg.type})`,
+        );
+      }
+    }
+
+    // ── Transactional batch insert ──
+    const { created, totalPages } = await this.prisma.$transaction(
+      async (tx) => {
+        const rows: any[] = [];
+        let total = 0;
+
+        for (const seg of dto.segments) {
+          if (seg.type === 'FULL_SURA') {
+            const nums: number[] = seg.surahNumbers;
+            const rawPages = nums.reduce(
+              (sum, n) => sum + (getSuraByNumber(n)?.totalPages ?? 0),
+              0,
+            );
+            const pages = Math.round(rawPages * 100) / 100;
+
+            const rec = await tx.recitation.create({
+              data: {
+                studentId: dto.studentId,
+                instructorId,
+                surahNumber: nums[0],
+                surahNumbers: nums,
+                pagesRecited: pages,
+                isCompleteSura: true,
+                rating: dto.rating,
+                homework: null, // attached to first row only, see below
+                date: recitationDate,
+              },
+            });
+            rows.push(rec);
+            total += pages;
+          } else {
+            // AYA_RANGE
+            const s: number = seg.startSurah;
+            const sa: number = seg.startAya;
+            const ea: number = seg.endAya;
+            const pages = calculatePages(s, sa, s, ea);
+            const pagesDec = new Prisma.Decimal(pages.toFixed(3));
+            const meta = getSurahMeta(s)!;
+
+            const rec = await tx.recitation.create({
+              data: {
+                studentId: dto.studentId,
+                instructorId,
+                surahNumber: s,
+                surahNumbers: [s],
+                pagesRecited: Math.max(1, Math.round(pages)),
+                isCompleteSura: sa === 1 && ea >= meta.numAyas,
+                rating: dto.rating,
+                homework: null,
+                date: recitationDate,
+                startSurah: s,
+                startAya: sa,
+                endSurah: s,
+                endAya: ea,
+                pagesCalculated: pagesDec,
+              },
+            });
+            rows.push(rec);
+            total += pages;
+          }
+        }
+
+        // Homework is per-session — stamp it on the first row so the
+        // "latest homework" query keeps working unchanged.
+        if (dto.homework && rows.length > 0) {
+          const updated = await tx.recitation.update({
+            where: { id: rows[0].id },
+            data: { homework: dto.homework },
+          });
+          rows[0] = updated;
+        }
+
+        return { created: rows, totalPages: total };
+      },
+    );
+
+    // ── Combined points entry (outside the transaction — non-critical) ──
+    if (created.length > 0 && totalPages > 0) {
+      await this.applyCombinedBatchPoints(
+        dto.studentId,
+        instructorId,
+        dto.rating,
+        totalPages,
+        created[0].id,
+        pointsCreatedAt,
+      );
+    }
+
+    return {
+      data: created,
+      count: created.length,
+      totalPages: Math.round(totalPages * 100) / 100,
+      message: 'تم تسجيل التسميع بنجاح',
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // BULK MAQRAA — unchanged, now propagates createdAt
   // ═══════════════════════════════════════════════════════════
 
   async createBulkMaqraa(dto: BulkMaqraaDto, instructorId: string) {
@@ -187,6 +435,7 @@ export class RecitationService {
       throw new BadRequestException(`رقم السورة غير صالح: ${dto.surahNumber}`);
     }
 
+    const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
     const results = [];
 
     for (const studentId of dto.studentIds) {
@@ -209,6 +458,7 @@ export class RecitationService {
         'MAQRAA',
         dto.pagesRecited || 0,
         recitation.id,
+        pointsCreatedAt,
       );
 
       results.push(recitation);
@@ -223,7 +473,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // POINTS — NEW format (decimal, exact)
+  // POINTS — new format (decimal, exact)
   // ═══════════════════════════════════════════════════════════
 
   private async applyNewFormatPoints(
@@ -232,23 +482,13 @@ export class RecitationService {
     rating: string,
     pages: number,
     sourceId: string,
+    createdAt: Date,
   ) {
     try {
       const amount = calculatePoints(pages, rating);
       if (!amount || amount <= 0) return;
 
-      const category =
-        (await this.prisma.pointCategory.findFirst({
-          where: { name: { contains: 'Quran', mode: 'insensitive' } },
-        })) ||
-        (await this.prisma.pointCategory.findFirst({
-          where: { name: { contains: 'recitation', mode: 'insensitive' } },
-        })) ||
-        (await this.prisma.pointCategory.findFirst({
-          where: { name: { contains: 'Memorization', mode: 'insensitive' } },
-        })) ||
-        (await this.prisma.pointCategory.findFirst());
-
+      const category = await this.findRecitationCategory();
       if (!category) return;
 
       await this.prisma.pointsLog.create({
@@ -261,6 +501,7 @@ export class RecitationService {
           awardedBy: instructorId,
           sourceId,
           sourceType: 'RECITATION',
+          createdAt,
         },
       });
     } catch (error) {
@@ -269,105 +510,183 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // POINTS — LEGACY format (unchanged behavior)
+  // POINTS — legacy per-rule path
   // ═══════════════════════════════════════════════════════════
 
- private async applyRecitationPoints(
-  studentId: string,
-  instructorId: string,
-  rating: string,
-  pageCount: number,
-  sourceId: string,
-) {
-  try {
-    if (
-      rating === 'REPEAT' ||
-      rating === 'DID_NOT_MEMORIZE' ||
-      pageCount <= 0
-    ) {
-      return;
-    }
-
-    let pointResult: { points: number; ruleNameAr: string } | null = null;
-
-    if (rating === 'MAQRAA') {
-      const maqraaRule =
-        await this.pointRulesService.findByCode('RECITE_MAQRAA');
-      if (maqraaRule && maqraaRule.isActive) {
-        const rulePoints = Number(maqraaRule.points);
-        const pts = maqraaRule.isPerPage
-          ? rulePoints * pageCount
-          : rulePoints;
-        pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
+  private async applyRecitationPoints(
+    studentId: string,
+    instructorId: string,
+    rating: string,
+    pageCount: number,
+    sourceId: string,
+    createdAt: Date,
+  ) {
+    try {
+      if (
+        rating === 'REPEAT' ||
+        rating === 'DID_NOT_MEMORIZE' ||
+        pageCount <= 0
+      ) {
+        return;
       }
-    } else {
-      const raw = await this.pointRulesService.getRecitationPoints(
-        rating,
-        pageCount,
-      );
-      if (raw) {
-        // Coerce in case rule.points is a Decimal
-        pointResult = {
-          points: Number(raw.points),
-          ruleNameAr: raw.ruleNameAr,
-        };
+
+      let pointResult: { points: number; ruleNameAr: string } | null = null;
+
+      if (rating === 'MAQRAA') {
+        const maqraaRule =
+          await this.pointRulesService.findByCode('RECITE_MAQRAA');
+        if (maqraaRule && maqraaRule.isActive) {
+          const rulePoints = Number(maqraaRule.points);
+          const pts = maqraaRule.isPerPage
+            ? rulePoints * pageCount
+            : rulePoints;
+          pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
+        }
+      } else {
+        const raw = await this.pointRulesService.getRecitationPoints(
+          rating,
+          pageCount,
+        );
+        if (raw) {
+          pointResult = {
+            points: Number(raw.points),
+            ruleNameAr: raw.ruleNameAr,
+          };
+        }
       }
-    }
 
-    // ── Hard guard against NaN / null / zero ──
-    if (
-      !pointResult ||
-      pointResult.points === null ||
-      pointResult.points === undefined ||
-      isNaN(pointResult.points) ||
-      pointResult.points === 0
-    ) {
-      console.warn(
-        `[applyRecitationPoints] No points awarded — rating=${rating} pages=${pageCount} result=${JSON.stringify(pointResult)}`,
+      if (
+        !pointResult ||
+        pointResult.points === null ||
+        pointResult.points === undefined ||
+        isNaN(pointResult.points) ||
+        pointResult.points === 0
+      ) {
+        console.warn(
+          `[applyRecitationPoints] No points awarded — rating=${rating} pages=${pageCount} result=${JSON.stringify(pointResult)}`,
+        );
+        return;
+      }
+
+      const category = await this.findRecitationCategory();
+      if (!category) {
+        console.error('[applyRecitationPoints] No PointCategory found in DB');
+        return;
+      }
+
+      await this.prisma.pointsLog.create({
+        data: {
+          studentId,
+          categoryId: category.id,
+          amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
+          rating: rating as any,
+          description: pointResult.ruleNameAr,
+          awardedBy: instructorId,
+          sourceId,
+          sourceType: 'RECITATION',
+          createdAt,
+        },
+      });
+
+      console.log(
+        `[applyRecitationPoints] ✅ Awarded ${pointResult.points} pts to student ${studentId} for ${rating}`,
       );
-      return;
+    } catch (error) {
+      console.error('[applyRecitationPoints] ❌ Error:', error);
     }
-
-    const category =
-      (await this.prisma.pointCategory.findFirst({
-        where: { name: { contains: 'Quran', mode: 'insensitive' } },
-      })) ||
-      (await this.prisma.pointCategory.findFirst({
-        where: { name: { contains: 'recitation', mode: 'insensitive' } },
-      })) ||
-      (await this.prisma.pointCategory.findFirst({
-        where: { name: { contains: 'Memorization', mode: 'insensitive' } },
-      })) ||
-      (await this.prisma.pointCategory.findFirst({
-        where: { name: { contains: 'حفظ', mode: 'insensitive' } },
-      })) ||
-      (await this.prisma.pointCategory.findFirst());
-
-    if (!category) {
-      console.error('[applyRecitationPoints] No PointCategory found in DB');
-      return;
-    }
-
-    await this.prisma.pointsLog.create({
-      data: {
-        studentId,
-        categoryId: category.id,
-        amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
-        rating: rating as any,
-        description: pointResult.ruleNameAr,
-        awardedBy: instructorId,
-        sourceId,
-        sourceType: 'RECITATION',
-      },
-    });
-
-    console.log(
-      `[applyRecitationPoints] ✅ Awarded ${pointResult.points} pts to student ${studentId} for ${rating}`,
-    );
-  } catch (error) {
-    console.error('[applyRecitationPoints] ❌ Error:', error);
   }
-}
+
+  // ═══════════════════════════════════════════════════════════
+  // POINTS — combined across a batch of segments (NEW)
+  //
+  // One PointsLog row per batch, computed from the TOTAL pages across
+  // all segments. This keeps non-linear per-page rules (e.g. "bonus
+  // beyond N pages") correct — if we awarded per-segment instead, an
+  // instructor could game thresholds by splitting a session.
+  // ═══════════════════════════════════════════════════════════
+
+  private async applyCombinedBatchPoints(
+    studentId: string,
+    instructorId: string,
+    rating: string,
+    totalPages: number,
+    sourceId: string,
+    createdAt: Date,
+  ) {
+    try {
+      if (
+        rating === 'REPEAT' ||
+        rating === 'DID_NOT_MEMORIZE' ||
+        totalPages <= 0
+      ) {
+        return;
+      }
+
+      let pointResult: { points: number; ruleNameAr: string } | null = null;
+
+      if (rating === 'MAQRAA') {
+        const maqraaRule =
+          await this.pointRulesService.findByCode('RECITE_MAQRAA');
+        if (maqraaRule && maqraaRule.isActive) {
+          const rulePoints = Number(maqraaRule.points);
+          const pts = maqraaRule.isPerPage
+            ? rulePoints * totalPages
+            : rulePoints;
+          pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
+        }
+      } else {
+        const raw = await this.pointRulesService.getRecitationPoints(
+          rating,
+          totalPages,
+        );
+        if (raw) {
+          pointResult = {
+            points: Number(raw.points),
+            ruleNameAr: raw.ruleNameAr,
+          };
+        }
+      }
+
+      if (
+        !pointResult ||
+        isNaN(pointResult.points) ||
+        pointResult.points === 0
+      ) {
+        console.warn(
+          `[applyCombinedBatchPoints] No points — rating=${rating} pages=${totalPages}`,
+        );
+        return;
+      }
+
+      const category = await this.findRecitationCategory();
+      if (!category) {
+        console.error(
+          '[applyCombinedBatchPoints] No PointCategory found in DB',
+        );
+        return;
+      }
+
+      await this.prisma.pointsLog.create({
+        data: {
+          studentId,
+          categoryId: category.id,
+          amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
+          rating: rating as any,
+          description: `${pointResult.ruleNameAr} (${totalPages.toFixed(2)} ص)`,
+          awardedBy: instructorId,
+          sourceId,
+          sourceType: 'RECITATION',
+          createdAt,
+        },
+      });
+
+      console.log(
+        `[applyCombinedBatchPoints] ✅ Awarded ${pointResult.points} pts for ${totalPages} combined pages`,
+      );
+    } catch (error) {
+      console.error('[applyCombinedBatchPoints] ❌ Error:', error);
+    }
+  }
 
   // ═══════════════════════════════════════════════════════════
   // NEXT-AYA SUGGESTION
@@ -411,7 +730,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // STUDENT PROGRESS — aya-union for new format, legacy fallback
+  // STUDENT PROGRESS — unchanged
   // ═══════════════════════════════════════════════════════════
 
   async getStudentProgress(studentId: string) {
@@ -455,7 +774,6 @@ export class RecitationService {
         const sura = getSuraByNumber(surahNum);
 
         if (rec.rating === 'VERY_GOOD' || rec.rating === 'GOOD') {
-          // ── NEW: aya-range entry ──
           if (isAyaRange && rec.startSurah === surahNum) {
             for (let a = rec.startAya!; a <= rec.endAya!; a++) {
               progress.ayaUnion.add(a);
@@ -464,14 +782,10 @@ export class RecitationService {
             if (meta && progress.ayaUnion.size >= meta.numAyas) {
               progress.isComplete = true;
             }
-          }
-          // ── LEGACY: multi-surah ──
-          else if (isMulti) {
+          } else if (isMulti) {
             progress.individualPages += sura?.totalPages ?? 0;
             progress.isComplete = true;
-          }
-          // ── LEGACY: single-surah pages ──
-          else {
+          } else {
             progress.individualPages += rec.pagesRecited;
             if (
               rec.isCompleteSura ||
@@ -492,7 +806,6 @@ export class RecitationService {
       const meta = getSurahMeta(sura.number);
       const numAyas = meta?.numAyas ?? 0;
 
-      // Legacy contribution
       const legacyPages = Math.min(
         progress?.individualPages || 0,
         sura.totalPages,
@@ -500,12 +813,10 @@ export class RecitationService {
       const legacyPct =
         sura.totalPages > 0 ? (legacyPages / sura.totalPages) * 100 : 0;
 
-      // New-format contribution
       const ayaCount = progress?.ayaUnion.size || 0;
       const ayaPct = numAyas > 0 ? (ayaCount / numAyas) * 100 : 0;
       const ayaPages = (ayaPct / 100) * sura.totalPages;
 
-      // Take the larger source
       const rawPct = Math.max(legacyPct, ayaPct);
       const percentage =
         Math.min(100, Math.round(rawPct * 10) / 10);
@@ -549,7 +860,7 @@ export class RecitationService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // RECITATION HISTORY — unchanged
+  // HISTORY / HOMEWORK / OVERVIEW / SURA LIST / DELETE — unchanged
   // ═══════════════════════════════════════════════════════════
 
   async getStudentRecitations(studentId: string) {
@@ -571,10 +882,6 @@ export class RecitationService {
       }),
     };
   }
-
-  // ═══════════════════════════════════════════════════════════
-  // LATEST HOMEWORK — unchanged
-  // ═══════════════════════════════════════════════════════════
 
   async getStudentHomework(studentId: string) {
     const latestWithHomework = await this.prisma.recitation.findFirst({
@@ -599,10 +906,6 @@ export class RecitationService {
       suraName: suraNames.join('، '),
     };
   }
-
-  // ═══════════════════════════════════════════════════════════
-  // INSTRUCTOR OVERVIEW — unchanged
-  // ═══════════════════════════════════════════════════════════
 
   async getInstructorOverview(instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
@@ -676,10 +979,6 @@ export class RecitationService {
     return { data: overview };
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // QURAN METADATA
-  // ═══════════════════════════════════════════════════════════
-
   getSuraList() {
     return {
       data: SURA_METADATA.map((s) => ({
@@ -690,10 +989,6 @@ export class RecitationService {
       })),
     };
   }
-
-  // ═══════════════════════════════════════════════════════════
-  // DELETE — unchanged
-  // ═══════════════════════════════════════════════════════════
 
   async deleteRecitation(id: string) {
     const recitation = await this.prisma.recitation.findUnique({

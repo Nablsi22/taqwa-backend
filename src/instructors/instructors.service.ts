@@ -10,12 +10,23 @@ import { UpdateInstructorDto } from './dto/update-instructor.dto';
 import { Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
+/**
+ * Reusable Prisma filter for "active" (non-soft-deleted) students.
+ * Kept as a module-level constant so every query in this service
+ * stays consistent; adding new methods that forget this filter
+ * is the class of bug we're fixing here.
+ *
+ * Ref: Prisma filtered relation count (v4.3+)
+ *   https://www.prisma.io/docs/orm/prisma-client/queries/aggregation-grouping-summarizing
+ */
+const ACTIVE_STUDENT_FILTER = { deletedAt: null } as const;
+
 @Injectable()
 export class InstructorsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * List all instructors with student count and optional search.
+   * List all instructors with ACTIVE student count and optional search.
    * When `all=true`, pagination is bypassed and every matching
    * record is returned (hard-capped at 2000 to protect the server).
    */
@@ -59,7 +70,10 @@ export class InstructorsService {
         },
         _count: {
           select: {
-            students: true,
+            // ═══ THE FIX ═══
+            // Filter out soft-deleted students from the aggregate count
+            // so admin list shows only currently-active students.
+            students: { where: ACTIVE_STUDENT_FILTER },
           },
         },
       },
@@ -96,7 +110,7 @@ export class InstructorsService {
   }
 
   /**
-   * Get single instructor by ID with full details and student list
+   * Get single instructor by ID with full details and ACTIVE student list.
    */
   async findOne(id: string) {
     const instructor = await this.prisma.instructor.findUnique({
@@ -117,7 +131,7 @@ export class InstructorsService {
           },
         },
         students: {
-          where: { deletedAt: null },
+          where: ACTIVE_STUDENT_FILTER,
           select: {
             id: true,
             fullName: true,
@@ -127,7 +141,7 @@ export class InstructorsService {
         },
         _count: {
           select: {
-            students: { where: { deletedAt: null } },
+            students: { where: ACTIVE_STUDENT_FILTER },
           },
         },
       },
@@ -154,7 +168,7 @@ export class InstructorsService {
   }
 
   /**
-   * Create a new instructor — creates User + Instructor records
+   * Create a new instructor — creates User + Instructor records.
    */
   async create(dto: CreateInstructorDto) {
     const existingUser = await this.prisma.user.findUnique({
@@ -209,7 +223,7 @@ export class InstructorsService {
   }
 
   /**
-   * Update instructor details
+   * Update instructor details.
    */
   async update(id: string, dto: UpdateInstructorDto) {
     const existing = await this.prisma.instructor.findUnique({
@@ -290,7 +304,7 @@ export class InstructorsService {
   }
 
   /**
-   * Delete instructor — only if they have no active students
+   * Delete instructor — only if they have no active students.
    */
   async remove(id: string) {
     const instructor = await this.prisma.instructor.findUnique({
@@ -298,7 +312,7 @@ export class InstructorsService {
       include: {
         _count: {
           select: {
-            students: { where: { deletedAt: null } },
+            students: { where: ACTIVE_STUDENT_FILTER },
           },
         },
       },
@@ -325,7 +339,7 @@ export class InstructorsService {
   }
 
   /**
-   * Reset instructor password (admin action)
+   * Reset instructor password (admin action).
    */
   async resetPassword(id: string, newPassword: string) {
     const instructor = await this.prisma.instructor.findUnique({
