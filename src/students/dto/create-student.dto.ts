@@ -31,18 +31,18 @@ export class CreateStudentDto {
   address?: string;
 
   /**
-   * Parent's primary phone — required.
-   * Syrian formats accepted:
+   * Parent's primary phone — now optional.
+   * Syrian formats accepted when provided:
    *   +963XXXXXXXXX  (international, 9 digits after country code)
    *   963XXXXXXXXX   (without +)
    *   09XXXXXXXX     (local, 10 digits starting with 09)
    */
+  @IsOptional()
   @IsString()
-  @IsNotEmpty({ message: 'رقم هاتف ولي الأمر مطلوب' })
   @Matches(/^(\+?963\d{9}|09\d{8})$/, {
     message: 'رقم الهاتف غير صالح. الصيغة: +963XXXXXXXXX أو 09XXXXXXXX',
   })
-  phone1: string;
+  phone1?: string;
 
   @IsOptional()
   @IsString()
