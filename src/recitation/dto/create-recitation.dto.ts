@@ -8,9 +8,11 @@ import {
   IsArray,
   ArrayMinSize,
   ValidateIf,
+  ValidateNested,
   Min,
   Max,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 
 export enum RecitationRatingDto {
   VERY_GOOD = 'VERY_GOOD',
@@ -20,9 +22,14 @@ export enum RecitationRatingDto {
   MAQRAA = 'MAQRAA',
 }
 
-// ═══════════════════════════════════════════════════════════
-// LEGACY single-segment DTO (still used by old endpoint)
-// ═══════════════════════════════════════════════════════════
+export enum BatchSegmentType {
+  FULL_SURA = 'FULL_SURA',
+  AYA_RANGE = 'AYA_RANGE',
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LEGACY single-segment DTO (still used by POST /recitations)
+// ═══════════════════════════════════════════════════════════════════
 export class CreateRecitationDto {
   @IsString()
   studentId: string;
@@ -65,16 +72,52 @@ export class CreateRecitationDto {
   date: string;
 }
 
-// ═══════════════════════════════════════════════════════════
-// NEW — multi-segment batch DTO (mixed full-sura + aya-range)
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// PER-SEGMENT DTO (NEW) — each segment carries its own rating
+// ═══════════════════════════════════════════════════════════════════
 //
-// Each segment is either:
-//   { type: 'FULL_SURA', surahNumbers: [89, 90] }
-//   { type: 'AYA_RANGE', startSurah: 89, startAya: 1, endAya: 15 }
+// Discriminated by `type`:
+//   { type: 'FULL_SURA', surahNumbers: [89, 90], rating: 'VERY_GOOD' }
+//   { type: 'AYA_RANGE', startSurah: 89, startAya: 1, endAya: 15, rating: 'GOOD' }
 //
-// Validated shallowly here; deep shape-validation happens in the service
-// so we can return Arabic error messages consistent with the rest of the API.
+// Shape (which fields are required for which `type`) is validated in
+// the service so we can return position-aware Arabic messages — same
+// pattern used elsewhere in this controller.
+//
+export class BatchSegmentDto {
+  @IsEnum(BatchSegmentType)
+  type: BatchSegmentType;
+
+  @IsEnum(RecitationRatingDto)
+  rating: RecitationRatingDto;
+
+  // FULL_SURA fields
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @Max(114, { each: true })
+  surahNumbers?: number[];
+
+  // AYA_RANGE fields
+  @IsOptional() @IsInt() @Min(1) @Max(114)
+  startSurah?: number;
+
+  @IsOptional() @IsInt() @Min(1)
+  startAya?: number;
+
+  @IsOptional() @IsInt() @Min(1)
+  endAya?: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MULTI-SEGMENT BATCH DTO
+// ═══════════════════════════════════════════════════════════════════
+//
+// Parent `rating` is OPTIONAL and is used ONLY for the DID_NOT_MEMORIZE
+// placeholder path (where no segments are submitted). For real multi-
+// segment sessions, every element of `segments[]` carries its own rating.
 //
 export class CreateRecitationBatchDto {
   @IsString()
@@ -83,20 +126,23 @@ export class CreateRecitationBatchDto {
   @IsDateString()
   date: string;
 
+  @IsOptional()
   @IsEnum(RecitationRatingDto)
-  rating: RecitationRatingDto;
+  rating?: RecitationRatingDto;
 
   @IsString()
   @IsOptional()
   homework?: string;
 
   @IsArray()
-  segments: any[];
+  @ValidateNested({ each: true })
+  @Type(() => BatchSegmentDto)
+  segments: BatchSegmentDto[];
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // BULK MAQRAA — unchanged
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 export class BulkMaqraaDto {
   @IsString({ each: true })
   studentIds: string[];

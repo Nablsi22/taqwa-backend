@@ -9,6 +9,8 @@ import {
   CreateRecitationDto,
   CreateRecitationBatchDto,
   BulkMaqraaDto,
+  RecitationRatingDto,
+  BatchSegmentType,
 } from './dto/create-recitation.dto';
 import { PointRulesService } from '../point-rules/point-rules.service';
 import {
@@ -31,9 +33,9 @@ export class RecitationService {
     private pointRulesService: PointRulesService,
   ) {}
 
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // Helpers
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
   private async resolveInstructorId(userId: string): Promise<string> {
     const instructor = await this.prisma.instructor.findFirst({
@@ -103,10 +105,9 @@ export class RecitationService {
     );
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // CREATE — legacy single-recitation endpoint (UNCHANGED behavior
-  // except points.createdAt now mirrors the recitation date)
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
+  // CREATE — legacy single-recitation endpoint (UNCHANGED behavior)
+  // ═══════════════════════════════════════════════════════════════════
 
   async create(dto: CreateRecitationDto, instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
@@ -230,14 +231,22 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // CREATE BATCH — multi-segment session (NEW)
+  // ═══════════════════════════════════════════════════════════════════
+  // CREATE BATCH — multi-segment session with PER-SEGMENT RATINGS
   //
-  // Each segment becomes its own Recitation row (clean progress-
-  // tracking semantics), all inserted in a single transaction. One
-  // combined PointsLog is created for the total pages across all
-  // segments and attached (via sourceId) to the first recitation.
-  // ═══════════════════════════════════════════════════════════
+  // Each segment carries its own rating and becomes its own Recitation
+  // row. Each segment also generates its own PointsLog row, computed
+  // from that segment's pages × multiplier(segment.rating) using the
+  // EXISTING rating-multiplier rules (no formula change).
+  //
+  // Routing per segment type matches the single-recitation `create`
+  // method exactly:
+  //   AYA_RANGE → applyNewFormatPoints (decimal-precise)
+  //   FULL_SURA → applyRecitationPoints (legacy per-rule)
+  //
+  // The DID_NOT_MEMORIZE placeholder path is preserved unchanged for
+  // backward compatibility with existing Flutter clients.
+  // ═══════════════════════════════════════════════════════════════════
 
   async createBatch(
     dto: CreateRecitationBatchDto,
@@ -253,7 +262,7 @@ export class RecitationService {
     const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
     const recitationDate = new Date(dto.date);
 
-    const isNoMemorize = dto.rating === 'DID_NOT_MEMORIZE';
+    const isNoMemorize = dto.rating === RecitationRatingDto.DID_NOT_MEMORIZE;
 
     // ── DID_NOT_MEMORIZE: placeholder row, no segments, no points ──
     if (isNoMemorize) {
@@ -265,7 +274,7 @@ export class RecitationService {
           surahNumbers: [1],
           pagesRecited: 0,
           isCompleteSura: false,
-          rating: dto.rating,
+          rating: dto.rating!,
           homework: dto.homework || null,
           date: recitationDate,
           startSurah: 1,
@@ -288,13 +297,22 @@ export class RecitationService {
       throw new BadRequestException('يجب إضافة مقطع واحد على الأقل');
     }
 
+    const validRatings = Object.values(RecitationRatingDto) as string[];
+
     for (const [idx, seg] of dto.segments.entries()) {
       const pos = idx + 1;
       if (!seg || typeof seg !== 'object') {
         throw new BadRequestException(`المقطع ${pos} غير صالح`);
       }
 
-      if (seg.type === 'FULL_SURA') {
+      // Per-segment rating — required on every segment.
+      if (!seg.rating || !validRatings.includes(seg.rating as string)) {
+        throw new BadRequestException(
+          `المقطع ${pos}: التقييم غير صالح أو مفقود`,
+        );
+      }
+
+      if (seg.type === BatchSegmentType.FULL_SURA) {
         if (!Array.isArray(seg.surahNumbers) || seg.surahNumbers.length === 0) {
           throw new BadRequestException(
             `المقطع ${pos}: يجب اختيار سورة واحدة على الأقل`,
@@ -307,7 +325,7 @@ export class RecitationService {
             );
           }
         }
-      } else if (seg.type === 'AYA_RANGE') {
+      } else if (seg.type === BatchSegmentType.AYA_RANGE) {
         const s = seg.startSurah;
         const sa = seg.startAya;
         const ea = seg.endAya;
@@ -327,15 +345,24 @@ export class RecitationService {
       }
     }
 
-    // ── Transactional batch insert ──
-    const { created, totalPages } = await this.prisma.$transaction(
+    // ── Transactional batch insert (per-segment ratings) ──
+    type SegmentMeta = {
+      recId: string;
+      rating: string;
+      pages: number;
+      isAyaRange: boolean;
+    };
+
+    const { created, segmentMeta } = await this.prisma.$transaction(
       async (tx) => {
         const rows: any[] = [];
-        let total = 0;
+        const meta: SegmentMeta[] = [];
 
         for (const seg of dto.segments) {
-          if (seg.type === 'FULL_SURA') {
-            const nums: number[] = seg.surahNumbers;
+          const segRating = seg.rating as string;
+
+          if (seg.type === BatchSegmentType.FULL_SURA) {
+            const nums: number[] = seg.surahNumbers!;
             const rawPages = nums.reduce(
               (sum, n) => sum + (getSuraByNumber(n)?.totalPages ?? 0),
               0,
@@ -350,21 +377,26 @@ export class RecitationService {
                 surahNumbers: nums,
                 pagesRecited: pages,
                 isCompleteSura: true,
-                rating: dto.rating,
+                rating: segRating as any,
                 homework: null, // attached to first row only, see below
                 date: recitationDate,
               },
             });
             rows.push(rec);
-            total += pages;
+            meta.push({
+              recId: rec.id,
+              rating: segRating,
+              pages,
+              isAyaRange: false,
+            });
           } else {
             // AYA_RANGE
-            const s: number = seg.startSurah;
-            const sa: number = seg.startAya;
-            const ea: number = seg.endAya;
+            const s: number = seg.startSurah!;
+            const sa: number = seg.startAya!;
+            const ea: number = seg.endAya!;
             const pages = calculatePages(s, sa, s, ea);
             const pagesDec = new Prisma.Decimal(pages.toFixed(3));
-            const meta = getSurahMeta(s)!;
+            const sMeta = getSurahMeta(s)!;
 
             const rec = await tx.recitation.create({
               data: {
@@ -373,8 +405,8 @@ export class RecitationService {
                 surahNumber: s,
                 surahNumbers: [s],
                 pagesRecited: Math.max(1, Math.round(pages)),
-                isCompleteSura: sa === 1 && ea >= meta.numAyas,
-                rating: dto.rating,
+                isCompleteSura: sa === 1 && ea >= sMeta.numAyas,
+                rating: segRating as any,
                 homework: null,
                 date: recitationDate,
                 startSurah: s,
@@ -385,7 +417,12 @@ export class RecitationService {
               },
             });
             rows.push(rec);
-            total += pages;
+            meta.push({
+              recId: rec.id,
+              rating: segRating,
+              pages,
+              isAyaRange: true,
+            });
           }
         }
 
@@ -399,21 +436,36 @@ export class RecitationService {
           rows[0] = updated;
         }
 
-        return { created: rows, totalPages: total };
+        return { created: rows, segmentMeta: meta };
       },
     );
 
-    // ── Combined points entry (outside the transaction — non-critical) ──
-    if (created.length > 0 && totalPages > 0) {
-      await this.applyCombinedBatchPoints(
-        dto.studentId,
-        instructorId,
-        dto.rating,
-        totalPages,
-        created[0].id,
-        pointsCreatedAt,
-      );
+    // ── Per-segment points (one PointsLog row per segment) ──
+    // Routing matches single-recitation `create`: AYA_RANGE → decimal,
+    // FULL_SURA → legacy per-rule. Both helpers are unchanged.
+    for (const m of segmentMeta) {
+      if (m.isAyaRange) {
+        await this.applyNewFormatPoints(
+          dto.studentId,
+          instructorId,
+          m.rating,
+          m.pages,
+          m.recId,
+          pointsCreatedAt,
+        );
+      } else {
+        await this.applyRecitationPoints(
+          dto.studentId,
+          instructorId,
+          m.rating,
+          m.pages,
+          m.recId,
+          pointsCreatedAt,
+        );
+      }
     }
+
+    const totalPages = segmentMeta.reduce((s, m) => s + m.pages, 0);
 
     return {
       data: created,
@@ -423,9 +475,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // BULK MAQRAA — unchanged, now propagates createdAt
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
+  // BULK MAQRAA — unchanged
+  // ═══════════════════════════════════════════════════════════════════
 
   async createBulkMaqraa(dto: BulkMaqraaDto, instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
@@ -472,9 +524,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // POINTS — new format (decimal, exact)
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
   private async applyNewFormatPoints(
     studentId: string,
@@ -509,9 +561,9 @@ export class RecitationService {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // POINTS — legacy per-rule path
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
   private async applyRecitationPoints(
     studentId: string,
@@ -596,101 +648,9 @@ export class RecitationService {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // POINTS — combined across a batch of segments (NEW)
-  //
-  // One PointsLog row per batch, computed from the TOTAL pages across
-  // all segments. This keeps non-linear per-page rules (e.g. "bonus
-  // beyond N pages") correct — if we awarded per-segment instead, an
-  // instructor could game thresholds by splitting a session.
-  // ═══════════════════════════════════════════════════════════
-
-  private async applyCombinedBatchPoints(
-    studentId: string,
-    instructorId: string,
-    rating: string,
-    totalPages: number,
-    sourceId: string,
-    createdAt: Date,
-  ) {
-    try {
-      if (
-        rating === 'REPEAT' ||
-        rating === 'DID_NOT_MEMORIZE' ||
-        totalPages <= 0
-      ) {
-        return;
-      }
-
-      let pointResult: { points: number; ruleNameAr: string } | null = null;
-
-      if (rating === 'MAQRAA') {
-        const maqraaRule =
-          await this.pointRulesService.findByCode('RECITE_MAQRAA');
-        if (maqraaRule && maqraaRule.isActive) {
-          const rulePoints = Number(maqraaRule.points);
-          const pts = maqraaRule.isPerPage
-            ? rulePoints * totalPages
-            : rulePoints;
-          pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
-        }
-      } else {
-        const raw = await this.pointRulesService.getRecitationPoints(
-          rating,
-          totalPages,
-        );
-        if (raw) {
-          pointResult = {
-            points: Number(raw.points),
-            ruleNameAr: raw.ruleNameAr,
-          };
-        }
-      }
-
-      if (
-        !pointResult ||
-        isNaN(pointResult.points) ||
-        pointResult.points === 0
-      ) {
-        console.warn(
-          `[applyCombinedBatchPoints] No points — rating=${rating} pages=${totalPages}`,
-        );
-        return;
-      }
-
-      const category = await this.findRecitationCategory();
-      if (!category) {
-        console.error(
-          '[applyCombinedBatchPoints] No PointCategory found in DB',
-        );
-        return;
-      }
-
-      await this.prisma.pointsLog.create({
-        data: {
-          studentId,
-          categoryId: category.id,
-          amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
-          rating: rating as any,
-          description: `${pointResult.ruleNameAr} (${totalPages.toFixed(2)} ص)`,
-          awardedBy: instructorId,
-          sourceId,
-          sourceType: 'RECITATION',
-          createdAt,
-        },
-      });
-
-      console.log(
-        `[applyCombinedBatchPoints] ✅ Awarded ${pointResult.points} pts for ${totalPages} combined pages`,
-      );
-    } catch (error) {
-      console.error('[applyCombinedBatchPoints] ❌ Error:', error);
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // NEXT-AYA SUGGESTION
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
   async getNextSuggestion(studentId: string) {
     const last = await this.prisma.recitation.findFirst({
@@ -729,9 +689,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // STUDENT PROGRESS — unchanged
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
   async getStudentProgress(studentId: string) {
     const recitations = await this.prisma.recitation.findMany({
@@ -859,9 +819,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // HISTORY / HOMEWORK / OVERVIEW / SURA LIST / DELETE — unchanged
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
   async getStudentRecitations(studentId: string) {
     const recitations = await this.prisma.recitation.findMany({
