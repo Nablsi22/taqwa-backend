@@ -26,6 +26,40 @@ import {
   getSurahMeta,
 } from '../quran-metadata/quran-ayat-pages.util';
 
+// ╔═══════════════════════════════════════════════════════════════════╗
+// LAST-RECITATION DTO TYPES (Deliverable 2)
+//
+// Returned alongside (never instead of) existing fields. Every consumer
+// that doesn't yet know about `lastRecitation` keeps working unchanged.
+// ╚═══════════════════════════════════════════════════════════════════╝
+
+export type SegmentKind = 'AYA_RANGE' | 'FULL_SURA' | 'MULTI_SURA';
+
+export interface LastSegment {
+  kind: SegmentKind;
+  surahNumber: number;
+  surahNameAr: string;
+  fromAya: number | null;
+  toAya: number | null;
+  ayaCount: number;
+  pages: number;
+  rating: string;
+}
+
+export interface LastRecitation {
+  recitedAt: Date;
+  date: Date;
+  overallRating: string | null;
+  totalAyat: number;
+  totalPages: number;
+  segments: LastSegment[];
+}
+
+// Window used to group rows produced by a single `createBatch`
+// transaction (or two consecutive `create` calls submitted as one
+// session by the instructor). Spec: "within 1 minute".
+const SESSION_WINDOW_SECONDS = 60;
+
 @Injectable()
 export class RecitationService {
   constructor(
@@ -33,9 +67,9 @@ export class RecitationService {
     private pointRulesService: PointRulesService,
   ) {}
 
-  // ═══════════════════════════════════════════════════════════════════
-  // Helpers
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // Helpers (unchanged)
+  // ─────────────────────────────────────────────────────────────────
 
   private async resolveInstructorId(userId: string): Promise<string> {
     const instructor = await this.prisma.instructor.findFirst({
@@ -55,19 +89,6 @@ export class RecitationService {
     return [rec.surahNumber];
   }
 
-  /**
-   * Compose a timestamp that carries the RECITATION's calendar date
-   * (what the teacher selected) plus the CURRENT time-of-day (when
-   * the record was actually entered).
-   *
-   * Why: when the instructor back-fills yesterday's recitation today,
-   * the corresponding PointsLog row must display yesterday's date in
-   * the student's points history — but two back-fills submitted right
-   * now for the same past day should still sort by entry order.
-   *
-   * Parse YYYY-MM-DD manually (avoids `new Date("2025-04-10")` UTC
-   * midnight shifting a day in negative-offset timezones).
-   */
   private composePointsCreatedAt(dateStr: string): Date {
     const [y, m, d] = dateStr.split('-').map(Number);
     const now = new Date();
@@ -82,11 +103,6 @@ export class RecitationService {
     );
   }
 
-  /**
-   * Resolve the PointCategory used for all recitation-sourced points.
-   * Fallback chain kept identical to the prior inline logic to avoid
-   * any behavior change for existing deployments.
-   */
   private async findRecitationCategory() {
     return (
       (await this.prisma.pointCategory.findFirst({
@@ -105,9 +121,184 @@ export class RecitationService {
     );
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // CREATE — legacy single-recitation endpoint (UNCHANGED behavior)
-  // ═══════════════════════════════════════════════════════════════════
+  // ╔═══════════════════════════════════════════════════════════════════╗
+  // LAST-RECITATION BUILDER (Deliverable 2)
+  //
+  // For each studentId, returns the segments that belong to the latest
+  // session — defined as the row with `MAX(created_at)` plus every other
+  // row sharing the same calendar `date` and inserted within
+  // SESSION_WINDOW_SECONDS of that anchor.
+  //
+  // Single round-trip: one $queryRaw using a CTE + DISTINCT ON. Postgres
+  // resolves anchor + window in the database; we just shape the result.
+  //
+  // Refs:
+  //   Prisma raw queries:            https://www.prisma.io/docs/orm/prisma-client/using-raw-sql/raw-queries
+  //   Postgres DISTINCT ON:          https://www.postgresql.org/docs/current/sql-select.html#SQL-DISTINCT
+  // ╚═══════════════════════════════════════════════════════════════════╝
+
+  private async buildLastRecitationFor(
+    studentIds: string[],
+  ): Promise<Map<string, LastRecitation | null>> {
+    const result = new Map<string, LastRecitation | null>();
+    for (const id of studentIds) result.set(id, null);
+    if (studentIds.length === 0) return result;
+
+    type Row = {
+      id: string;
+      studentId: string;
+      surahNumber: number;
+      surahNumbers: number[] | null;
+      pagesRecited: number;
+      isCompleteSura: boolean;
+      rating: string;
+      homework: string | null;
+      date: Date;
+      createdAt: Date;
+      startSurah: number | null;
+      startAya: number | null;
+      endSurah: number | null;
+      endAya: number | null;
+      pagesCalculated: Prisma.Decimal | string | number | null;
+    };
+
+    const sessionRows = await this.prisma.$queryRaw<Row[]>(Prisma.sql`
+      WITH anchors AS (
+        SELECT DISTINCT ON (student_id)
+          student_id,
+          created_at AS anchor_at,
+          date       AS anchor_date
+        FROM recitations
+        WHERE student_id IN (${Prisma.join(studentIds)})
+        ORDER BY student_id, created_at DESC
+      )
+      SELECT
+        r.id                AS "id",
+        r.student_id        AS "studentId",
+        r.surah_number      AS "surahNumber",
+        r.surah_numbers     AS "surahNumbers",
+        r.pages_recited     AS "pagesRecited",
+        r.is_complete_sura  AS "isCompleteSura",
+        r.rating::text      AS "rating",
+        r.homework          AS "homework",
+        r.date              AS "date",
+        r.created_at        AS "createdAt",
+        r."startSurah"      AS "startSurah",
+        r."startAya"        AS "startAya",
+        r."endSurah"        AS "endSurah",
+        r."endAya"          AS "endAya",
+        r."pagesCalculated" AS "pagesCalculated"
+      FROM recitations r
+      INNER JOIN anchors a
+        ON r.student_id = a.student_id
+       AND r.date       = a.anchor_date
+       AND r.created_at >= a.anchor_at - (${SESSION_WINDOW_SECONDS} * INTERVAL '1 second')
+       AND r.created_at <= a.anchor_at
+      ORDER BY r.student_id ASC, r.created_at ASC
+    `);
+
+    // Group rows by studentId
+    const byStudent = new Map<string, Row[]>();
+    for (const row of sessionRows) {
+      const bucket = byStudent.get(row.studentId);
+      if (bucket) bucket.push(row);
+      else byStudent.set(row.studentId, [row]);
+    }
+
+    // Shape each session into the response DTO
+    for (const [studentId, rows] of byStudent) {
+      if (rows.length === 0) continue;
+      const anchor = rows[rows.length - 1]; // ascending order → last is max(createdAt)
+
+      const segments: LastSegment[] = rows.map((row) => {
+        const surahNums =
+          row.surahNumbers && row.surahNumbers.length > 0
+            ? row.surahNumbers
+            : [row.surahNumber];
+
+        const isAyaRange =
+          row.startAya != null &&
+          row.endAya != null &&
+          row.startSurah != null &&
+          row.endSurah != null &&
+          row.startSurah === row.endSurah;
+
+        const isMultiSura = surahNums.length > 1;
+
+        let kind: SegmentKind;
+        let surahNumber: number;
+        let surahNameAr: string;
+        let fromAya: number | null = null;
+        let toAya: number | null = null;
+        let ayaCount = 0;
+        let pages = 0;
+
+        if (isAyaRange) {
+          kind = 'AYA_RANGE';
+          surahNumber = row.startSurah!;
+          const meta = getSurahMeta(surahNumber);
+          surahNameAr = meta?.nameAr ?? getSuraName(surahNumber);
+          fromAya = row.startAya!;
+          toAya = row.endAya!;
+          ayaCount = toAya - fromAya + 1;
+          pages =
+            row.pagesCalculated != null
+              ? Number(row.pagesCalculated)
+              : Number(row.pagesRecited);
+        } else if (isMultiSura) {
+          kind = 'MULTI_SURA';
+          surahNumber = surahNums[0];
+          surahNameAr = surahNums.map((n) => getSuraName(n)).join('، ');
+          ayaCount = surahNums.reduce(
+            (s, n) => s + (getSurahMeta(n)?.numAyas ?? 0),
+            0,
+          );
+          pages = Number(row.pagesRecited);
+        } else {
+          kind = 'FULL_SURA';
+          surahNumber = surahNums[0];
+          const meta = getSurahMeta(surahNumber);
+          surahNameAr = meta?.nameAr ?? getSuraName(surahNumber);
+          ayaCount = meta?.numAyas ?? 0;
+          pages = Number(row.pagesRecited);
+        }
+
+        return {
+          kind,
+          surahNumber,
+          surahNameAr,
+          fromAya,
+          toAya,
+          ayaCount,
+          pages: Math.round(pages * 1000) / 1000,
+          rating: row.rating,
+        };
+      });
+
+      const totalAyat = segments.reduce((s, seg) => s + seg.ayaCount, 0);
+      const totalPages =
+        Math.round(segments.reduce((s, seg) => s + seg.pages, 0) * 100) / 100;
+
+      const ratingSet = new Set(segments.map((s) => s.rating));
+      const overallRating =
+        ratingSet.size === 1 ? segments[0].rating : null;
+
+      result.set(studentId, {
+        recitedAt: anchor.createdAt,
+        date: anchor.date,
+        overallRating,
+        totalAyat,
+        totalPages,
+        segments,
+      });
+    }
+
+    return result;
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // CREATE — legacy single-recitation (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   async create(dto: CreateRecitationDto, instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
@@ -174,7 +365,6 @@ export class RecitationService {
       };
     }
 
-    // ── Legacy multi-surah path ──
     if (!dto.surahNumbers || dto.surahNumbers.length === 0) {
       throw new BadRequestException('surahNumbers مطلوب');
     }
@@ -231,22 +421,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // CREATE BATCH — multi-segment session with PER-SEGMENT RATINGS
-  //
-  // Each segment carries its own rating and becomes its own Recitation
-  // row. Each segment also generates its own PointsLog row, computed
-  // from that segment's pages × multiplier(segment.rating) using the
-  // EXISTING rating-multiplier rules (no formula change).
-  //
-  // Routing per segment type matches the single-recitation `create`
-  // method exactly:
-  //   AYA_RANGE → applyNewFormatPoints (decimal-precise)
-  //   FULL_SURA → applyRecitationPoints (legacy per-rule)
-  //
-  // The DID_NOT_MEMORIZE placeholder path is preserved unchanged for
-  // backward compatibility with existing Flutter clients.
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // CREATE BATCH (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   async createBatch(
     dto: CreateRecitationBatchDto,
@@ -264,7 +441,6 @@ export class RecitationService {
 
     const isNoMemorize = dto.rating === RecitationRatingDto.DID_NOT_MEMORIZE;
 
-    // ── DID_NOT_MEMORIZE: placeholder row, no segments, no points ──
     if (isNoMemorize) {
       const placeholder = await this.prisma.recitation.create({
         data: {
@@ -292,7 +468,6 @@ export class RecitationService {
       };
     }
 
-    // ── Validate all segments up front — fail the entire batch early ──
     if (!Array.isArray(dto.segments) || dto.segments.length === 0) {
       throw new BadRequestException('يجب إضافة مقطع واحد على الأقل');
     }
@@ -305,7 +480,6 @@ export class RecitationService {
         throw new BadRequestException(`المقطع ${pos} غير صالح`);
       }
 
-      // Per-segment rating — required on every segment.
       if (!seg.rating || !validRatings.includes(seg.rating as string)) {
         throw new BadRequestException(
           `المقطع ${pos}: التقييم غير صالح أو مفقود`,
@@ -345,7 +519,6 @@ export class RecitationService {
       }
     }
 
-    // ── Transactional batch insert (per-segment ratings) ──
     type SegmentMeta = {
       recId: string;
       rating: string;
@@ -378,7 +551,7 @@ export class RecitationService {
                 pagesRecited: pages,
                 isCompleteSura: true,
                 rating: segRating as any,
-                homework: null, // attached to first row only, see below
+                homework: null,
                 date: recitationDate,
               },
             });
@@ -390,7 +563,6 @@ export class RecitationService {
               isAyaRange: false,
             });
           } else {
-            // AYA_RANGE
             const s: number = seg.startSurah!;
             const sa: number = seg.startAya!;
             const ea: number = seg.endAya!;
@@ -426,8 +598,6 @@ export class RecitationService {
           }
         }
 
-        // Homework is per-session — stamp it on the first row so the
-        // "latest homework" query keeps working unchanged.
         if (dto.homework && rows.length > 0) {
           const updated = await tx.recitation.update({
             where: { id: rows[0].id },
@@ -440,9 +610,6 @@ export class RecitationService {
       },
     );
 
-    // ── Per-segment points (one PointsLog row per segment) ──
-    // Routing matches single-recitation `create`: AYA_RANGE → decimal,
-    // FULL_SURA → legacy per-rule. Both helpers are unchanged.
     for (const m of segmentMeta) {
       if (m.isAyaRange) {
         await this.applyNewFormatPoints(
@@ -475,9 +642,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // BULK MAQRAA — unchanged
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // BULK MAQRAA (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   async createBulkMaqraa(dto: BulkMaqraaDto, instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
@@ -524,9 +691,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // POINTS — new format (decimal, exact)
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // POINTS — new format (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   private async applyNewFormatPoints(
     studentId: string,
@@ -561,9 +728,9 @@ export class RecitationService {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // POINTS — legacy per-rule path
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // POINTS — legacy per-rule (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   private async applyRecitationPoints(
     studentId: string,
@@ -648,9 +815,9 @@ export class RecitationService {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // NEXT-AYA SUGGESTION
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // NEXT-AYA SUGGESTION (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   async getNextSuggestion(studentId: string) {
     const last = await this.prisma.recitation.findFirst({
@@ -689,9 +856,9 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // STUDENT PROGRESS — unchanged
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // STUDENT PROGRESS (UNCHANGED)
+  // ─────────────────────────────────────────────────────────────────
 
   async getStudentProgress(studentId: string) {
     const recitations = await this.prisma.recitation.findMany({
@@ -819,27 +986,37 @@ export class RecitationService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // HISTORY / HOMEWORK / OVERVIEW / SURA LIST / DELETE — unchanged
-  // ═══════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────
+  // STUDENT RECITATION HISTORY  ◄── EXTENDED for D2
+  //
+  // Adds top-level `lastRecitation` field. Existing `data` array shape
+  // is unchanged so any current consumer (e.g. Flutter `getStudentHistory`
+  // which reads `response.data['data']`) keeps working untouched.
+  // ─────────────────────────────────────────────────────────────────
 
   async getStudentRecitations(studentId: string) {
-    const recitations = await this.prisma.recitation.findMany({
-      where: { studentId },
-      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    const [recitations, lastMap] = await Promise.all([
+      this.prisma.recitation.findMany({
+        where: { studentId },
+        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+      }),
+      this.buildLastRecitationFor([studentId]),
+    ]);
+
+    const data = recitations.map((rec) => {
+      const surahNums = this.surahNumsOf(rec);
+      const suraNames = surahNums.map((n) => getSuraName(n));
+      return {
+        ...rec,
+        surahNumbers: surahNums,
+        suraName: suraNames.join('، '),
+        suraNames,
+      };
     });
 
     return {
-      data: recitations.map((rec) => {
-        const surahNums = this.surahNumsOf(rec);
-        const suraNames = surahNums.map((n) => getSuraName(n));
-        return {
-          ...rec,
-          surahNumbers: surahNums,
-          suraName: suraNames.join('، '),
-          suraNames,
-        };
-      }),
+      data,
+      lastRecitation: lastMap.get(studentId) ?? null,
     };
   }
 
@@ -867,6 +1044,14 @@ export class RecitationService {
     };
   }
 
+  // ─────────────────────────────────────────────────────────────────
+  // INSTRUCTOR OVERVIEW  ◄── EXTENDED for D2
+  //
+  // Adds `lastRecitation` per-student. All previously-returned fields
+  // stay byte-for-byte the same. The existing per-student aggregation
+  // loop is left untouched.
+  // ─────────────────────────────────────────────────────────────────
+
   async getInstructorOverview(instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
 
@@ -874,6 +1059,12 @@ export class RecitationService {
       where: { instructorId, deletedAt: null },
       include: { user: true },
     });
+
+    // One round-trip for ALL last-recitations across the instructor's
+    // entire roster. Avoids introducing per-student N+1 in the new code.
+    const lastMap = await this.buildLastRecitationFor(
+      students.map((s) => s.id),
+    );
 
     const overview = [];
 
@@ -933,6 +1124,8 @@ export class RecitationService {
         lastRating: lastRecitation?.rating || null,
         lastDate: lastRecitation?.date || null,
         homework: lastRecitation?.homework || null,
+        // ◄── NEW (D2): full last-session detail. Older clients ignore it.
+        lastRecitation: lastMap.get(student.id) ?? null,
       });
     }
 
