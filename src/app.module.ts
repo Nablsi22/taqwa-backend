@@ -15,7 +15,7 @@ import { PointRulesModule } from './point-rules/point-rules.module';
 import { RecitationModule } from './recitation/recitation.module';
 import { NotificationModule } from './notification/notification.module';
 import { InstructorAttendanceModule } from './instructor-attendance/instructor-attendance.module';
-
+import { TermsModule } from './terms/terms.module';
 
 @Module({
   imports: [
@@ -37,8 +37,9 @@ import { InstructorAttendanceModule } from './instructor-attendance/instructor-a
     GiftsModule,
     PointRulesModule,
     RecitationModule,
-    NotificationModule ,
+    NotificationModule,
     InstructorAttendanceModule,
+    TermsModule,
   ],
   providers: [
     {

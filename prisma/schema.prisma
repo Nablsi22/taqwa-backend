@@ -53,22 +53,22 @@ model User {
 }
 
 model Student {
-  id           String    @id @default(uuid())
-  userId       String    @unique @map("user_id")
-  fullName     String    @map("full_name")
-  fatherName   String    @map("father_name")
-  dateOfBirth  DateTime  @map("date_of_birth")
-  school       String?
-  grade        String?
-  address      String?
-  phone1       String?   @map("phone_1")
-  phone2       String?   @map("phone_2")
-  instructorId String    @map("instructor_id")
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
-  deletedAt    DateTime? @map("deleted_at")
-  credentialsSentAt   DateTime?   @map("credentials_sent_at")     // NEW
-  lastCredentialReset DateTime?   @map("last_credential_reset")   // NEW
+  id                  String    @id @default(uuid())
+  userId              String    @unique @map("user_id")
+  fullName            String    @map("full_name")
+  fatherName          String    @map("father_name")
+  dateOfBirth         DateTime  @map("date_of_birth")
+  school              String?
+  grade               String?
+  address             String?
+  phone1              String?   @map("phone_1")
+  phone2              String?   @map("phone_2")
+  instructorId        String    @map("instructor_id")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  deletedAt           DateTime? @map("deleted_at")
+  credentialsSentAt   DateTime? @map("credentials_sent_at")
+  lastCredentialReset DateTime? @map("last_credential_reset")
 
   user        User         @relation(fields: [userId], references: [id])
   instructor  Instructor   @relation(fields: [instructorId], references: [id])
@@ -139,29 +139,30 @@ model PointsLog {
   id          String            @id @default(uuid())
   studentId   String            @map("student_id")
   categoryId  String            @map("category_id")
-  amount      Decimal  @db.Decimal(7, 3)
+  amount      Decimal           @db.Decimal(7, 3)
   rating      RecitationRating?
   description String?
   awardedBy   String            @map("awarded_by")
-  sourceId    String?           @map("source_id")       // NEW
-  sourceType  String?           @map("source_type")     // NEW
+  sourceId    String?           @map("source_id")
+  sourceType  String?           @map("source_type")
+  termId      Int?              @map("term_id")
   createdAt   DateTime          @default(now()) @map("created_at")
 
   student  Student       @relation(fields: [studentId], references: [id])
   category PointCategory @relation(fields: [categoryId], references: [id])
+  term     Term?         @relation(fields: [termId], references: [id])
 
   @@index([studentId])
   @@index([categoryId])
   @@index([studentId, categoryId])
   @@index([createdAt])
   @@index([awardedBy])
-  @@index([sourceType, sourceId])                       // NEW
+  @@index([sourceType, sourceId])
+  @@index([termId])
+  @@index([studentId, termId])
   @@map("points_log")
 }
 
-// ═══════════════════════════════════════════════════════════
-// DYNAMIC POINT RULES — Admin-configurable scoring rules
-// ═══════════════════════════════════════════════════════════
 model PointRule {
   id          String   @id @default(uuid())
   code        String   @unique
@@ -180,9 +181,6 @@ model PointRule {
   @@map("point_rules")
 }
 
-// ═══════════════════════════════════════════════════════════
-// GIFTS STORE — Rewards catalog with images and point costs
-// ═══════════════════════════════════════════════════════════
 model Gift {
   id          String   @id @default(uuid())
   name        String
@@ -198,31 +196,34 @@ model Gift {
 }
 
 model Recitation {
-  id             String           @id @default(uuid())
-  studentId      String           @map("student_id")
-  instructorId   String           @map("instructor_id")
-  surahNumber    Int              @map("surah_number")           // kept for backward compat
-  surahNumbers   Int[]            @default([]) @map("surah_numbers") // NEW
-  pagesRecited   Float            @default(0) @map("pages_recited")
-  isCompleteSura Boolean          @default(false) @map("is_complete_sura")
-  rating         RecitationRating
-  homework       String?
-  date           DateTime         @db.Date
-  createdAt      DateTime         @default(now()) @map("created_at")
-  startSurah        Int?
-  startAya          Int?
-  endSurah          Int?
-  endAya            Int?
-  startPage         Int?
-  endPage           Int?
-  pagesCalculated   Decimal? @db.Decimal(5, 3)
+  id              String           @id @default(uuid())
+  studentId       String           @map("student_id")
+  instructorId    String           @map("instructor_id")
+  surahNumber     Int              @map("surah_number")
+  surahNumbers    Int[]            @default([]) @map("surah_numbers")
+  pagesRecited    Float            @default(0) @map("pages_recited")
+  isCompleteSura  Boolean          @default(false) @map("is_complete_sura")
+  rating          RecitationRating
+  homework        String?
+  date            DateTime         @db.Date
+  termId          Int?             @map("term_id")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  startSurah      Int?
+  startAya        Int?
+  endSurah        Int?
+  endAya          Int?
+  startPage       Int?
+  endPage         Int?
+  pagesCalculated Decimal?         @db.Decimal(5, 3)
 
   student Student @relation(fields: [studentId], references: [id])
+  term    Term?   @relation(fields: [termId], references: [id])
 
   @@index([studentId])
   @@index([instructorId])
   @@index([date])
   @@index([studentId, date])
+  @@index([termId])
   @@map("recitations")
 }
 
@@ -305,4 +306,27 @@ model Announcement {
   @@index([publishedAt])
   @@index([pinned, publishedAt])
   @@map("announcements")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TERM (Season) — separates Winter/Summer chapters so points display can
+// be filtered per-term while preserving full historical data.
+// Added 2026-06-08. Backfill performed by prisma/seed-terms.ts.
+// Auto-tagging of new rows is handled by DB triggers (see migration SQL).
+// ═══════════════════════════════════════════════════════════════════════════
+model Term {
+  id        Int       @id @default(autoincrement())
+  name      String    @unique
+  nameAr    String    @map("name_ar")
+  startDate DateTime  @map("start_date") @db.Date
+  endDate   DateTime? @map("end_date") @db.Date
+  isActive  Boolean   @default(false) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  recitations Recitation[]
+  pointsLog   PointsLog[]
+
+  @@index([isActive])
+  @@map("terms")
 }

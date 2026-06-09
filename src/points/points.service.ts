@@ -3,11 +3,13 @@ import {
   NotFoundException,
   BadRequestException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TermsService } from '../terms/terms.service';
 import { AwardPointsDto } from './dto/award-points.dto';
 
 /**
- * DTO for the new manual award endpoint. Either `ruleId` (for predefined
+ * DTO for the manual award endpoint. Either `ruleId` (for predefined
  * rules — amount comes from the rule, locked) OR (`amount` + `reason`)
  * for free-form custom points. Never both.
  */
@@ -23,11 +25,36 @@ export class PointsService {
   // Hard cap on custom point amounts to prevent runaway typos.
   private static readonly MAX_CUSTOM_POINTS = 9999;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly termsService: TermsService,
+  ) {}
 
-  // ═══════════════════════════════════════════════════════════════
-  // CATEGORIES (legacy — kept for backward compat with old clients)
-  // ═══════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════
+  // TERM FILTER RESOLVER
+  //
+  // Resolves which term to filter points queries by:
+  //   • explicit === undefined → currently-active term (default; this is
+  //                              what student APKs hit, giving them the
+  //                              "fresh start" view)
+  //   • explicit === 0         → no filter (admin viewing full history)
+  //   • explicit > 0           → that specific term id
+  // ═══════════════════════════════════════════════════════════════════════
+  private async resolveTermWhere(
+    explicit?: number | null,
+  ): Promise<Prisma.PointsLogWhereInput> {
+    if (explicit === 0) return {};
+    if (typeof explicit === 'number' && explicit > 0) {
+      return { termId: explicit };
+    }
+    const active = await this.termsService.getActiveTermId();
+    if (active == null) return {}; // no active term: safety fallback
+    return { termId: active };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // CATEGORIES (unchanged)
+  // ─────────────────────────────────────────────────────────────────────
   async getCategories() {
     const categories = await this.prisma.pointCategory.findMany({
       where: { isActive: true },
@@ -36,10 +63,9 @@ export class PointsService {
     return { data: categories };
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // LEGACY AWARD ENDPOINT — kept so existing app builds keep working
-  // until everyone updates. New clients should use awardManualPoints.
-  // ═══════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────
+  // LEGACY AWARD (unchanged — DB trigger fills term_id)
+  // ─────────────────────────────────────────────────────────────────────
   async awardPoints(dto: AwardPointsDto, awardedByUserId: string) {
     const student = await this.prisma.student.findUnique({
       where: { id: dto.studentId },
@@ -52,7 +78,7 @@ export class PointsService {
       where: { id: dto.categoryId },
     });
     if (!category || !category.isActive) {
-      throw new NotFoundException('فئة النقاط غير موجودة أو غير مفعلة');
+      throw new NotFoundException('فئة النقاط غير موجودة أو غير مفعّلة');
     }
 
     let amount = dto.amount;
@@ -92,22 +118,13 @@ export class PointsService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // NEW: AWARD MANUAL POINTS — single entry point for both
-  // rule-based and custom flows from the instructor modal.
-  //
-  // Rule-based flow: client sends { studentId, ruleId }. The rule's
-  // points value is locked (instructor cannot override), and the
-  // rule's nameAr becomes the description.
-  //
-  // Custom flow: client sends { studentId, amount, reason }. Reason
-  // is REQUIRED. Amount sign indicates earn vs deduct.
-  // ═══════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────
+  // MANUAL AWARD (unchanged — DB trigger fills term_id)
+  // ─────────────────────────────────────────────────────────────────────
   async awardManualPoints(
     input: AwardManualPointsInput,
     awardedByUserId: string,
   ) {
-    // ── Validate student ──────────────────────────────────────────
     const student = await this.prisma.student.findUnique({
       where: { id: input.studentId },
     });
@@ -115,8 +132,6 @@ export class PointsService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
-    // Determine which mode we're in. Exactly one of (ruleId) or
-    // (amount + reason) must be provided.
     const hasRule = !!input.ruleId;
     const hasCustom =
       input.amount !== undefined &&
@@ -140,12 +155,11 @@ export class PointsService {
     let finalDescription: string;
 
     if (hasRule) {
-      // ── Rule-based path ────────────────────────────────────────
       const rule = await this.prisma.pointRule.findUnique({
         where: { id: input.ruleId! },
       });
       if (!rule || !rule.isActive) {
-        throw new NotFoundException('القاعدة غير موجودة أو غير مفعلة');
+        throw new NotFoundException('القاعدة غير موجودة أو غير مفعّلة');
       }
       if (rule.isAutomatic) {
         throw new BadRequestException(
@@ -155,12 +169,9 @@ export class PointsService {
       finalAmount = rule.points;
       finalDescription = rule.nameAr;
     } else {
-      // ── Custom path ────────────────────────────────────────────
       const rawAmount = Number(input.amount);
       if (!Number.isFinite(rawAmount) || rawAmount === 0) {
-        throw new BadRequestException(
-          'يرجى إدخال عدد نقاط صالح (غير صفر)',
-        );
+        throw new BadRequestException('يرجى إدخال عدد نقاط صالح (غير صفر)');
       }
       if (Math.abs(rawAmount) > PointsService.MAX_CUSTOM_POINTS) {
         throw new BadRequestException(
@@ -171,17 +182,11 @@ export class PointsService {
       finalDescription = String(input.reason).trim();
     }
 
-    // ── Pick a PointCategory to satisfy the FK ───────────────────
-    // The category is now purely an internal FK requirement; the
-    // display layer ignores it for MANUAL entries and reads
-    // description instead. We just need ANY active category of the
-    // right sign so the row is valid.
     const neededType = finalAmount >= 0 ? 'EARN' : 'DEDUCT';
     let category = await this.prisma.pointCategory.findFirst({
       where: { type: neededType, isActive: true },
       orderBy: { createdAt: 'asc' },
     });
-    // Last-resort fallback: any active category at all.
     if (!category) {
       category = await this.prisma.pointCategory.findFirst({
         where: { isActive: true },
@@ -189,11 +194,10 @@ export class PointsService {
     }
     if (!category) {
       throw new BadRequestException(
-        'لا توجد فئات نقاط مفعلة في النظام. يرجى إضافة فئة من لوحة الإدارة.',
+        'لا توجد فئات نقاط مفعّلة في النظام. يرجى إضافة فئة من لوحة الإدارة.',
       );
     }
 
-    // ── Create the log ───────────────────────────────────────────
     const log = await this.prisma.pointsLog.create({
       data: {
         studentId: input.studentId,
@@ -203,9 +207,7 @@ export class PointsService {
         awardedBy: awardedByUserId,
         sourceType: 'MANUAL',
       },
-      include: {
-        student: { select: { fullName: true } },
-      },
+      include: { student: { select: { fullName: true } } },
     });
 
     return {
@@ -224,85 +226,84 @@ export class PointsService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // GET STUDENT POINTS — now returns displayLabel driven by
-  // sourceType so admin and instructor screens render identically.
-  // ═══════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════
+  // GET STUDENT POINTS — ◄── FILTERED to active term by default
+  //
+  // Student APKs (which don't pass termId) receive only active-term data,
+  // creating the "fresh start" effect without any client-side change.
+  // Admin/instructor APKs can pass `?termId=0` for full history or
+  // `?termId=<id>` for a specific past term.
+  // ═══════════════════════════════════════════════════════════════════════
   async getStudentPoints(
-  studentId: string,
-  params?: { page?: number; limit?: number },
-) {
-  const { page = 1, limit = 30 } = params || {};
-  const skip = (page - 1) * limit;
+    studentId: string,
+    params?: { page?: number; limit?: number; termId?: number | null },
+  ) {
+    const { page = 1, limit = 30, termId } = params || {};
+    const skip = (page - 1) * limit;
 
-  const student = await this.prisma.student.findUnique({
-    where: { id: studentId },
-  });
-  if (!student || student.deletedAt) {
-    throw new NotFoundException('الطالب غير موجود');
+    const student = await this.prisma.student.findUnique({
+      where: { id: studentId },
+    });
+    if (!student || student.deletedAt) {
+      throw new NotFoundException('الطالب غير موجود');
+    }
+
+    const termWhere = await this.resolveTermWhere(termId);
+    const baseWhere: Prisma.PointsLogWhereInput = { studentId, ...termWhere };
+
+    const [logs, total, totalPointsAgg] = await Promise.all([
+      this.prisma.pointsLog.findMany({
+        where: baseWhere,
+        include: {
+          category: { select: { name: true, nameAr: true, type: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.pointsLog.count({ where: baseWhere }),
+      this.prisma.pointsLog.aggregate({
+        where: baseWhere,
+        _sum: { amount: true },
+      }),
+    ]);
+
+    const totalPointsNumber = Number(totalPointsAgg._sum.amount ?? 0);
+
+    return {
+      student: {
+        id: student.id,
+        fullName: student.fullName,
+      },
+      totalPoints: totalPointsNumber,
+      data: logs.map((log) => {
+        const sourceTypeKey = this.normalizeSourceType(log.sourceType);
+        const displayLabel = this.labelForSourceType(sourceTypeKey);
+        return {
+          id: log.id,
+          description:
+            log.description ||
+            log.category?.nameAr ||
+            log.category?.name ||
+            '',
+          displayLabel,
+          sourceType: sourceTypeKey,
+          categoryName: log.category?.nameAr || log.category?.name || '',
+          categoryType: log.category?.type || null,
+          amount: Number(log.amount),
+          rating: log.rating,
+          createdAt: log.createdAt,
+        };
+      }),
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
   }
 
-  const [logs, total] = await Promise.all([
-    this.prisma.pointsLog.findMany({
-      where: { studentId },
-      include: {
-        category: { select: { name: true, nameAr: true, type: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip,
-      take: limit,
-    }),
-    this.prisma.pointsLog.count({ where: { studentId } }),
-  ]);
-
-  const totalPointsAgg = await this.prisma.pointsLog.aggregate({
-    where: { studentId },
-    _sum: { amount: true },
-  });
-
-  // ── FIX: coerce Decimal → number ──
-  const totalPointsNumber = Number(totalPointsAgg._sum.amount ?? 0);
-
-  return {
-    student: {
-      id: student.id,
-      fullName: student.fullName,
-    },
-    totalPoints: totalPointsNumber,
-    data: logs.map((log) => {
-      const sourceTypeKey = this.normalizeSourceType(log.sourceType);
-      const displayLabel = this.labelForSourceType(sourceTypeKey);
-      return {
-        id: log.id,
-        description:
-          log.description ||
-          log.category?.nameAr ||
-          log.category?.name ||
-          '',
-        displayLabel,
-        sourceType: sourceTypeKey,
-        categoryName: log.category?.nameAr || log.category?.name || '',
-        categoryType: log.category?.type || null,
-        // ── FIX: coerce Decimal → number ──
-        amount: Number(log.amount),
-        rating: log.rating,
-        createdAt: log.createdAt,
-      };
-    }),
-    meta: {
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-    },
-  };
-}
-
-  /**
-   * Normalize sourceType to one of the keys the UI expects.
-   * Old rows may have NULL — treat those as MANUAL since they
-   * predate the auto-points wiring.
-   */
   private normalizeSourceType(
     raw: string | null | undefined,
   ): 'MANUAL' | 'RECITATION' | 'ATTENDANCE' {
@@ -311,38 +312,43 @@ export class PointsService {
     return 'MANUAL';
   }
 
-  /** Arabic chip label corresponding to a source type. */
   private labelForSourceType(
     key: 'MANUAL' | 'RECITATION' | 'ATTENDANCE',
   ): string {
     switch (key) {
-      case 'RECITATION':
-        return 'تسميع';
-      case 'ATTENDANCE':
-        return 'حضور';
+      case 'RECITATION': return 'تسميع';
+      case 'ATTENDANCE': return 'حضور';
       case 'MANUAL':
-      default:
-        return 'نقاط خاصة';
+      default:           return 'نقاط خاصة';
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // LEADERBOARD
-  // ═══════════════════════════════════════════════════════════════
-  async getLeaderboard(params?: { limit?: number; instructorId?: string }) {
-    const { limit = 20, instructorId } = params || {};
+  // ═══════════════════════════════════════════════════════════════════════
+  // LEADERBOARD — ◄── FILTERED to active term by default
+  // ═══════════════════════════════════════════════════════════════════════
+  async getLeaderboard(params?: {
+    limit?: number;
+    instructorId?: string;
+    termId?: number | null;
+  }) {
+    const { limit = 20, instructorId, termId } = params || {};
 
-    const where: any = { deletedAt: null };
-    if (instructorId) where.instructorId = instructorId;
+    const studentWhere: Prisma.StudentWhereInput = { deletedAt: null };
+    if (instructorId) studentWhere.instructorId = instructorId;
+
+    const termWhere = await this.resolveTermWhere(termId);
 
     const students = await this.prisma.student.findMany({
-      where,
+      where: studentWhere,
       select: {
         id: true,
         fullName: true,
         instructorId: true,
         instructor: { select: { fullName: true } },
-        pointsLog: { select: { amount: true } },
+        pointsLog: {
+          where: termWhere,
+          select: { amount: true },
+        },
       },
       orderBy: { fullName: 'asc' },
     });
@@ -352,7 +358,10 @@ export class PointsService {
         id: s.id,
         fullName: s.fullName,
         instructorName: s.instructor.fullName,
-        totalPoints: s.pointsLog.reduce((sum, p) => sum + Number(p.amount), 0),
+        totalPoints: s.pointsLog.reduce(
+          (sum, p) => sum + Number(p.amount),
+          0,
+        ),
       }))
       .sort((a, b) => b.totalPoints - a.totalPoints)
       .slice(0, limit)
@@ -361,9 +370,9 @@ export class PointsService {
     return { data: ranked };
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // DELETE LOG
-  // ═══════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────
+  // DELETE LOG (unchanged)
+  // ─────────────────────────────────────────────────────────────────────
   async deleteLog(logId: string) {
     const log = await this.prisma.pointsLog.findUnique({
       where: { id: logId },
@@ -374,9 +383,9 @@ export class PointsService {
     return { message: 'تم حذف سجل النقاط بنجاح' };
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // UPDATE CATEGORY (admin only)
-  // ═══════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────
+  // UPDATE CATEGORY (unchanged)
+  // ─────────────────────────────────────────────────────────────────────
   async updateCategory(
     id: string,
     data: {
@@ -391,7 +400,7 @@ export class PointsService {
     });
     if (!category) throw new NotFoundException('الفئة غير موجودة');
 
-    const updateData: Record<string, any> = {};
+    const updateData: Record<string, unknown> = {};
 
     if (data.defaultValue !== undefined) {
       const numVal = Number(data.defaultValue);
@@ -416,7 +425,7 @@ export class PointsService {
         data: updateData,
       });
       return { message: 'تم تحديث الفئة بنجاح', data: updated };
-    } catch (error) {
+    } catch (error: any) {
       console.error('updateCategory Prisma error:', error);
       throw new BadRequestException(
         `فشل تحديث الفئة: ${error.message || error}`,

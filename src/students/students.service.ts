@@ -4,6 +4,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { TermsService } from '../terms/terms.service';
 import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
 import { Prisma } from '@prisma/client';
@@ -17,7 +18,28 @@ import {
 
 @Injectable()
 export class StudentsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly termsService: TermsService,
+  ) {}
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // TERM FILTER HELPER — same semantics as PointsService:
+  //   undefined → active term (default for students)
+  //   0         → all terms (admin view)
+  //   >0        → that specific term
+  // ═══════════════════════════════════════════════════════════════════════
+  private async resolveTermWhere(
+    explicit?: number | null,
+  ): Promise<Prisma.PointsLogWhereInput> {
+    if (explicit === 0) return {};
+    if (typeof explicit === 'number' && explicit > 0) {
+      return { termId: explicit };
+    }
+    const active = await this.termsService.getActiveTermId();
+    if (active == null) return {};
+    return { termId: active };
+  }
 
   async create(dto: CreateStudentDto, createdByUserId: string) {
     const instructor = await this.prisma.instructor.findUnique({
@@ -77,20 +99,21 @@ export class StudentsService {
     page?: number;
     limit?: number;
     all?: boolean;
+    termId?: number | null; // NEW
   }) {
-    const { search, instructorId, all = false } = params || {};
-    const page = Math.max(1, params?.page ?? 1);
+    const { search, instructorId, all = false, termId } = params || {};
+    const page  = Math.max(1, params?.page ?? 1);
     const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
-    const skip = (page - 1) * limit;
+    const skip  = (page - 1) * limit;
 
     const where: Prisma.StudentWhereInput = { deletedAt: null };
 
     if (search) {
       where.OR = [
-        { fullName: { contains: search, mode: 'insensitive' } },
+        { fullName:   { contains: search, mode: 'insensitive' } },
         { fatherName: { contains: search, mode: 'insensitive' } },
-        { phone1: { contains: search } },
-        { phone2: { contains: search } },
+        { phone1:     { contains: search } },
+        { phone2:     { contains: search } },
       ];
     }
 
@@ -102,11 +125,9 @@ export class StudentsService {
       where,
       orderBy: { fullName: 'asc' },
       include: {
-        user: { select: { username: true } },
-        instructor: {
-          include: { user: { select: { username: true } } },
-        },
-        _count: { select: { attendance: true, pointsLog: true } },
+        user:       { select: { username: true } },
+        instructor: { include: { user: { select: { username: true } } } },
+        _count:     { select: { attendance: true, pointsLog: true } },
       },
       ...(all ? { take: 2000 } : { skip, take: limit }),
     };
@@ -118,30 +139,28 @@ export class StudentsService {
 
     const studentIds = students.map((s) => s.id);
 
+    // ── Filter points by active term so totalPoints reflects current chapter ──
+    const termWhere = await this.resolveTermWhere(termId);
+
     const pointsGrouped = studentIds.length
       ? await this.prisma.pointsLog.groupBy({
           by: ['studentId', 'categoryId'],
-          where: { studentId: { in: studentIds } },
+          where: { studentId: { in: studentIds }, ...termWhere },
           _sum: { amount: true },
         })
       : [];
 
-    const categoryIds = [
-      ...new Set(pointsGrouped.map((g) => g.categoryId)),
-    ];
+    const categoryIds = [...new Set(pointsGrouped.map((g) => g.categoryId))];
     const categories = categoryIds.length
       ? await this.prisma.pointCategory.findMany({
           where: { id: { in: categoryIds } },
           select: { id: true, type: true },
         })
       : [];
-    const categoryTypeById = new Map(
-      categories.map((c) => [c.id, c.type]),
-    );
+    const categoryTypeById = new Map(categories.map((c) => [c.id, c.type]));
 
     const totalsByStudent = new Map<string, number>();
     for (const row of pointsGrouped) {
-      // ─── FIX: Decimal → number conversion ───
       const amount = Number(row._sum.amount ?? 0);
       const type = categoryTypeById.get(row.categoryId);
       const signed = type === 'DEDUCT' ? -amount : amount;
@@ -160,26 +179,27 @@ export class StudentsService {
       data: studentsWithPoints,
       meta: {
         total,
-        page: all ? 1 : page,
-        limit: all ? total : limit,
+        page:       all ? 1 : page,
+        limit:      all ? total : limit,
         totalPages: all ? 1 : Math.ceil(total / limit),
       },
     };
   }
 
-  async findOne(id: string) {
+  async findOne(id: string, params?: { termId?: number | null }) {
+    const termWhere = await this.resolveTermWhere(params?.termId);
+
     const student = await this.prisma.student.findUnique({
       where: { id },
       include: {
-        user: { select: { username: true } },
-        instructor: {
-          include: { user: { select: { username: true } } },
-        },
+        user:       { select: { username: true } },
+        instructor: { include: { user: { select: { username: true } } } },
         attendance: {
           orderBy: { date: 'desc' },
           take: 30,
         },
         pointsLog: {
+          where: termWhere, // ◄── active-term filter
           orderBy: { createdAt: 'desc' },
           take: 50,
           include: { category: true },
@@ -192,7 +212,6 @@ export class StudentsService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
-    // ─── FIX: Decimal → number conversion ───
     const totalPoints = student.pointsLog.reduce((sum: number, p) => {
       const amt = Number(p.amount);
       return p.category.type === 'EARN' ? sum + amt : sum - amt;
@@ -236,20 +255,18 @@ export class StudentsService {
     return this.prisma.student.update({
       where: { id },
       data: {
-        ...(dto.fullName && { fullName: dto.fullName }),
-        ...(dto.fatherName && { fatherName: dto.fatherName }),
+        ...(dto.fullName    && { fullName:    dto.fullName }),
+        ...(dto.fatherName  && { fatherName:  dto.fatherName }),
         ...(dto.dateOfBirth && { dateOfBirth: new Date(dto.dateOfBirth) }),
         ...(dto.instructorId && { instructorId: dto.instructorId }),
-        ...(dto.school !== undefined && { school: dto.school }),
-        ...(dto.address !== undefined && { address: dto.address }),
-        ...(dto.phone1 !== undefined && { phone1: dto.phone1 }),
-        ...(dto.phone2 !== undefined && { phone2: dto.phone2 }),
-        ...(dto.grade !== undefined && { grade: dto.grade }),
+        ...(dto.school   !== undefined && { school:   dto.school }),
+        ...(dto.address  !== undefined && { address:  dto.address }),
+        ...(dto.phone1   !== undefined && { phone1:   dto.phone1 }),
+        ...(dto.phone2   !== undefined && { phone2:   dto.phone2 }),
+        ...(dto.grade    !== undefined && { grade:    dto.grade }),
       },
       include: {
-        instructor: {
-          include: { user: { select: { username: true } } },
-        },
+        instructor: { include: { user: { select: { username: true } } } },
       },
     });
   }
@@ -304,10 +321,7 @@ export class StudentsService {
       }),
       this.prisma.user.update({
         where: { id: student.userId },
-        data: {
-          isActive: false,
-          fcmToken: null,
-        },
+        data: { isActive: false, fcmToken: null },
       }),
     ]);
 
@@ -318,8 +332,9 @@ export class StudentsService {
     };
   }
 
-  async getStudentStats(id: string) {
-    const student = await this.findOne(id);
+  async getStudentStats(id: string, params?: { termId?: number | null }) {
+    const student = await this.findOne(id, params);
+    const termWhere = await this.resolveTermWhere(params?.termId);
 
     const attendanceCount = await this.prisma.attendance.groupBy({
       by: ['status'],
@@ -329,7 +344,7 @@ export class StudentsService {
 
     const pointsByCategory = await this.prisma.pointsLog.groupBy({
       by: ['categoryId'],
-      where: { studentId: id },
+      where: { studentId: id, ...termWhere },
       _sum: { amount: true },
     });
 
@@ -342,9 +357,9 @@ export class StudentsService {
     };
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // CREDENTIALS MANAGEMENT — admin-only
-  // ═══════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────
+  // CREDENTIALS MANAGEMENT (unchanged)
+  // ─────────────────────────────────────────────────────────────────────
 
   async listCredentials(params?: {
     search?: string;
@@ -352,14 +367,14 @@ export class StudentsService {
   }) {
     const { search, sentFilter = 'all' } = params || {};
 
-    const where: any = { deletedAt: null };
+    const where: Prisma.StudentWhereInput = { deletedAt: null };
 
     if (search) {
       where.OR = [
         { fullName: { contains: search, mode: 'insensitive' } },
-        { phone1: { contains: search } },
-        { phone2: { contains: search } },
-        { user: { username: { contains: search } } },
+        { phone1:   { contains: search } },
+        { phone2:   { contains: search } },
+        { user:     { username: { contains: search } } },
       ];
     }
 
@@ -380,7 +395,7 @@ export class StudentsService {
         credentialsSentAt: true,
         lastCredentialReset: true,
         instructor: { select: { fullName: true } },
-        user: { select: { username: true } },
+        user:       { select: { username: true } },
       },
     });
 
@@ -396,8 +411,8 @@ export class StudentsService {
         lastCredentialReset: s.lastCredentialReset,
       })),
       meta: {
-        total: students.length,
-        sent: students.filter((s) => s.credentialsSentAt != null).length,
+        total:  students.length,
+        sent:   students.filter((s) => s.credentialsSentAt != null).length,
         unsent: students.filter((s) => s.credentialsSentAt == null).length,
       },
     };
@@ -420,15 +435,7 @@ export class StudentsService {
     return { message: 'تم تسجيل إرسال البيانات' };
   }
 
-  async recoverParkedUsernames(): Promise<{
-    message: string;
-    fixed: number;
-    mapping: Array<{
-      studentName: string;
-      oldUsername: string;
-      newUsername: string;
-    }>;
-  }> {
+  async recoverParkedUsernames() {
     const parked = await this.prisma.student.findMany({
       where: {
         deletedAt: null,
@@ -510,19 +517,7 @@ export class StudentsService {
     };
   }
 
-  async regenerateAllCredentials(): Promise<{
-    message: string;
-    count: number;
-    credentials: Array<{
-      studentId: string;
-      fullName: string;
-      username: string;
-      password: string;
-      phone1: string | null;
-      phone2: string | null;
-      instructorName: string;
-    }>;
-  }> {
+  async regenerateAllCredentials() {
     const students = await this.prisma.student.findMany({
       where: { deletedAt: null },
       orderBy: [{ dateOfBirth: 'asc' }, { createdAt: 'asc' }],
