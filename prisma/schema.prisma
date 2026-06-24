@@ -330,3 +330,33 @@ model Term {
   @@index([isActive])
   @@map("terms")
 }
+// ═══════════════════════════════════════════════════════════════════════════
+// NAWAWI 40 HADITH — added 2026-06-23 (additive; DB tables already applied on
+// production via direct migration, no SQL file in repo). Scalar-only models:
+// FK columns (hadith_number, term_id, student_id, instructor_id) are kept as
+// plain scalars — no relation fields — to avoid touching existing models.
+// term_id is populated by the DB trigger `set_term_id_to_active` on insert.
+// Generate-only: never run `prisma migrate` for these.
+// ═══════════════════════════════════════════════════════════════════════════
+model HadithPointsRule {
+  hadithNumber Int      @id @map("hadith_number")
+  basePoints   Int      @map("base_points")
+  title        String?
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("hadith_points_rules")
+}
+
+model HadithRecitation {
+  id            String   @id @default(uuid())
+  studentId     String   @map("student_id")
+  instructorId  String   @map("instructor_id")
+  hadithNumber  Int      @map("hadith_number")
+  pointsAwarded Int      @map("points_awarded")
+  termId        Int?     @map("term_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@unique([studentId, hadithNumber])
+  @@map("hadith_recitations")
+}

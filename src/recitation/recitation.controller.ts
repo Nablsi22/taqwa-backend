@@ -15,6 +15,7 @@ import {
   CreateRecitationBatchDto,
   BulkMaqraaDto,
 } from './dto/create-recitation.dto';
+import { CreateHadithRecitationDto } from './dto/create-hadith-recitation.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -52,11 +53,31 @@ export class RecitationController {
     return this.recitationService.createBulkMaqraa(dto, instructorId);
   }
 
+  // POST /recitations/hadith — record one Nawawi-40 hadith recitation
+  // Static route — declared before the `:id` matcher below.
+  @Post('hadith')
+  @Roles('INSTRUCTOR', 'ADMIN')
+  async recordHadith(
+    @Body() dto: CreateHadithRecitationDto,
+    @Req() req: any,
+  ) {
+    const instructorId = req.user.id;
+    return this.recitationService.recordHadithRecitation(dto, instructorId);
+  }
+
   // GET /recitations/suras
   @Get('suras')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
   getSuraList() {
     return this.recitationService.getSuraList();
+  }
+
+  // GET /recitations/hadith/rules — all 42 Nawawi rules (rules-read roles)
+  // Static route — declared before the `:id` matcher below.
+  @Get('hadith/rules')
+  @Roles('ADMIN', 'INSTRUCTOR')
+  getHadithRules() {
+    return this.recitationService.getHadithRules();
   }
 
   // GET /recitations/overview

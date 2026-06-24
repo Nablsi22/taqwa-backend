@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -12,6 +13,7 @@ import {
   RecitationRatingDto,
   BatchSegmentType,
 } from './dto/create-recitation.dto';
+import { CreateHadithRecitationDto } from './dto/create-hadith-recitation.dto';
 import { PointRulesService } from '../point-rules/point-rules.service';
 import {
   SURA_METADATA,
@@ -59,6 +61,10 @@ export interface LastRecitation {
 // transaction (or two consecutive `create` calls submitted as one
 // session by the instructor). Spec: "within 1 minute".
 const SESSION_WINDOW_SECONDS = 60;
+
+// PointCategory "Nawawi 40 Hadith" — fixed id seeded on prod. Every hadith
+// recitation's points_log row is filed under this exact category.
+const HADITH_CATEGORY_ID = 'a0000000-0000-4000-8000-000000000040';
 
 @Injectable()
 export class RecitationService {
@@ -1163,5 +1169,93 @@ export class RecitationService {
           ? `تم حذف التسميع وإلغاء ${result.deletedPointsCount} نقطة مرتبطة به`
           : 'تم حذف التسميع بنجاح',
     };
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // NAWAWI 40 HADITH — record one recitation (mirrors the Quran write
+  // pattern: resolve instructor → verify student → snapshot points →
+  // insert recitation + points_log atomically).
+  //
+  // English exceptions by design (backend messages for this feature are
+  // English). Both inserts live in ONE $transaction so a failure on
+  // either rolls back both: never points without a recitation row, nor a
+  // recitation row without points.
+  // ─────────────────────────────────────────────────────────────────
+
+  async recordHadithRecitation(
+    dto: CreateHadithRecitationDto,
+    instructorId: string,
+  ) {
+    instructorId = await this.resolveInstructorId(instructorId);
+
+    try {
+      const recitation = await this.prisma.$transaction(async (tx) => {
+        // Verify the student exists.
+        const student = await tx.student.findUnique({
+          where: { id: dto.studentId },
+        });
+        if (!student) throw new NotFoundException('Student not found');
+
+        // Snapshot base_points from the rule — the awarded amount is frozen
+        // on the recitation row, independent of future rule edits.
+        const rule = await tx.hadithPointsRule.findUnique({
+          where: { hadithNumber: dto.hadithNumber },
+        });
+        if (!rule) throw new NotFoundException('Hadith rule not found');
+
+        const basePoints = rule.basePoints;
+
+        // 1) hadith_recitations — termId left null; the set_term_id_to_active
+        //    trigger stamps the active term on insert.
+        const created = await tx.hadithRecitation.create({
+          data: {
+            studentId: dto.studentId,
+            instructorId,
+            hadithNumber: dto.hadithNumber,
+            pointsAwarded: basePoints,
+          },
+        });
+
+        // 2) points_log — same transaction, sourceId points back at the new
+        //    recitation row (mirrors Quran's RECITATION sourceType).
+        await tx.pointsLog.create({
+          data: {
+            studentId: dto.studentId,
+            categoryId: HADITH_CATEGORY_ID,
+            amount: new Prisma.Decimal(basePoints),
+            awardedBy: instructorId,
+            sourceId: created.id,
+            sourceType: 'HADITH_RECITATION',
+          },
+        });
+
+        return created;
+      });
+
+      return {
+        data: recitation,
+        pointsAwarded: recitation.pointsAwarded,
+        message: 'Hadith recitation recorded successfully',
+      };
+    } catch (error) {
+      // UNIQUE(student_id, hadith_number) violation → already recorded.
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException(
+          'Hadith already recorded for this student.',
+        );
+      }
+      throw error;
+    }
+  }
+
+  // All 42 Nawawi rules, ordered by hadith number (1 → 42).
+  async getHadithRules() {
+    const data = await this.prisma.hadithPointsRule.findMany({
+      orderBy: { hadithNumber: 'asc' },
+    });
+    return { data };
   }
 }
