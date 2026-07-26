@@ -142,32 +142,34 @@ export class StudentsService {
     // ── Filter points by active term so totalPoints reflects current chapter ──
     const termWhere = await this.resolveTermWhere(termId);
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // TOTALS — amounts are persisted ALREADY SIGNED.
+    //
+    // PointsService.awardPoints() negates DEDUCT rows at write time, so the
+    // sign lives in the data. Verified against production: 682 of 682 DEDUCT
+    // rows are negative, 0 of 3500 EARN rows are. A plain SUM is therefore
+    // the correct and only total.
+    //
+    // The previous implementation grouped by categoryId, looked the category
+    // type up, and negated DEDUCT sums a SECOND time — turning every
+    // deduction into a credit and inflating each student's total by twice
+    // their deductions. Summing in the database also removes the
+    // floating-point drift that surfaced totals as e.g. 211.105000000000002.
+    //
+    // Grouping by studentId alone additionally removes the category lookup
+    // query that the old sign logic required.
+    // ═══════════════════════════════════════════════════════════════════════
     const pointsGrouped = studentIds.length
       ? await this.prisma.pointsLog.groupBy({
-          by: ['studentId', 'categoryId'],
+          by: ['studentId'],
           where: { studentId: { in: studentIds }, ...termWhere },
           _sum: { amount: true },
         })
       : [];
 
-    const categoryIds = [...new Set(pointsGrouped.map((g) => g.categoryId))];
-    const categories = categoryIds.length
-      ? await this.prisma.pointCategory.findMany({
-          where: { id: { in: categoryIds } },
-          select: { id: true, type: true },
-        })
-      : [];
-    const categoryTypeById = new Map(categories.map((c) => [c.id, c.type]));
-
     const totalsByStudent = new Map<string, number>();
     for (const row of pointsGrouped) {
-      const amount = Number(row._sum.amount ?? 0);
-      const type = categoryTypeById.get(row.categoryId);
-      const signed = type === 'DEDUCT' ? -amount : amount;
-      totalsByStudent.set(
-        row.studentId,
-        (totalsByStudent.get(row.studentId) ?? 0) + signed,
-      );
+      totalsByStudent.set(row.studentId, Number(row._sum.amount ?? 0));
     }
 
     const studentsWithPoints = students.map((student) => ({
@@ -212,10 +214,23 @@ export class StudentsService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
-    const totalPoints = student.pointsLog.reduce((sum: number, p) => {
-      const amt = Number(p.amount);
-      return p.category.type === 'EARN' ? sum + amt : sum - amt;
-    }, 0);
+    // ═══════════════════════════════════════════════════════════════════════
+    // TOTAL — aggregated over the FULL filtered set, not the embedded rows.
+    //
+    // The `pointsLog` include above is a capped preview (take: 50) meant for
+    // display. Summing it, as the previous version did, silently truncated
+    // the total for any student with more rows than the cap — and several
+    // already exceed it.
+    //
+    // The sign also comes from the stored amount rather than being
+    // re-derived from the category type; re-deriving it double-negated every
+    // DEDUCT row. See the note in findAll() for the verification data.
+    // ═══════════════════════════════════════════════════════════════════════
+    const totalsAgg = await this.prisma.pointsLog.aggregate({
+      where: { studentId: id, ...termWhere },
+      _sum: { amount: true },
+    });
+    const totalPoints = Number(totalsAgg._sum.amount ?? 0);
 
     return { ...student, totalPoints };
   }
