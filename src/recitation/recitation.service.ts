@@ -701,6 +701,31 @@ export class RecitationService {
   // POINTS — new format (UNCHANGED)
   // ─────────────────────────────────────────────────────────────────
 
+
+  // ---------------------------------------------------------------
+  // POINTS - unified recitation description (presentational only).
+  //
+  // Both write paths emit an identical label that always carries the
+  // page count, so two students with different page totals can never
+  // display the same text. No point value is computed or altered
+  // here, and no existing points_log row is ever rewritten.
+  // ---------------------------------------------------------------
+
+  private static readonly RATING_AR: Readonly<Record<string, string>> = {
+    VERY_GOOD: 'جيد جداً',
+    GOOD: 'جيد',
+    REPEAT: 'إعادة',
+    DID_NOT_MEMORIZE: 'لم يحفظ',
+    MAQRAA: 'مقرأة',
+  };
+
+  /** Always renders the page count, e.g. 1.94 -> "... 1.94 ... - ...". */
+  private buildRecitationDescription(pages: number, rating: string): string {
+    const ratingAr = RecitationService.RATING_AR[rating] ?? rating;
+    const safePages = Number.isFinite(pages) && pages > 0 ? pages : 0;
+    return `تسميع ${safePages.toFixed(2)} صفحة — ${ratingAr}`;
+  }
+
   private async applyNewFormatPoints(
     studentId: string,
     instructorId: string,
@@ -722,7 +747,7 @@ export class RecitationService {
           categoryId: category.id,
           amount: new Prisma.Decimal(amount.toFixed(3)),
           rating: rating as any,
-          description: `تسميع ${pages.toFixed(2)} صفحة — ${rating}`,
+          description: this.buildRecitationDescription(pages, rating),
           awardedBy: instructorId,
           sourceId,
           sourceType: 'RECITATION',
@@ -805,7 +830,7 @@ export class RecitationService {
           categoryId: category.id,
           amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
           rating: rating as any,
-          description: pointResult.ruleNameAr,
+          description: this.buildRecitationDescription(pageCount, rating),
           awardedBy: instructorId,
           sourceId,
           sourceType: 'RECITATION',
@@ -1257,5 +1282,43 @@ export class RecitationService {
       orderBy: { hadithNumber: 'asc' },
     });
     return { data };
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // NAWAWI 40 HADITH — memorization map for one student.
+  //
+  // Returns which of the 42 ahadith the student has already recorded,
+  // CUMULATIVE across all terms: a memorized hadith stays memorized,
+  // so this is deliberately NOT filtered by activeTermId (unlike the
+  // points-facing endpoints). Backed by UNIQUE(student_id,
+  // hadith_number), so each number appears at most once.
+  //
+  // Read-only and additive — no existing query or formula is touched.
+  // ─────────────────────────────────────────────────────────────────
+  async getStudentHadithProgress(studentId: string) {
+    const student = await this.prisma.student.findUnique({
+      where: { id: studentId },
+      select: { id: true },
+    });
+    if (!student) throw new NotFoundException('Student not found');
+
+    const rows = await this.prisma.hadithRecitation.findMany({
+      where: { studentId },
+      select: {
+        hadithNumber: true,
+        pointsAwarded: true,
+        createdAt: true,
+      },
+      orderBy: { hadithNumber: 'asc' },
+    });
+
+    return {
+      data: {
+        memorized: rows.map((r) => r.hadithNumber),
+        details: rows,
+        count: rows.length,
+        total: 42,
+      },
+    };
   }
 }
