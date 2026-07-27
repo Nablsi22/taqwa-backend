@@ -735,7 +735,21 @@ export class RecitationService {
     createdAt: Date,
   ) {
     try {
-      const amount = calculatePoints(pages, rating);
+      // --- SINGLE SOURCE OF TRUTH ---------------------------------
+      // Per-page rates come from the admin-editable point_rules table,
+      // exactly as the full-sura path does, so an edit on the rules
+      // screen applies to BOTH write paths. calculatePoints() remains
+      // only as a fallback when no matching active rule exists, which
+      // preserves the previous behaviour instead of silently awarding
+      // nothing.
+      const ruleResult = await this.pointRulesService.getRecitationPoints(
+        rating,
+        pages,
+      );
+      const ruleAmount = ruleResult ? Number(ruleResult.points) : NaN;
+      const amount = Number.isFinite(ruleAmount)
+        ? ruleAmount
+        : calculatePoints(pages, rating);
       if (!amount || amount <= 0) return;
 
       const category = await this.findRecitationCategory();
