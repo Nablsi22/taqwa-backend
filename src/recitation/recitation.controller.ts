@@ -95,6 +95,14 @@ export class RecitationController {
     return this.recitationService.getNextSuggestion(studentId);
   }
 
+  // GET /recitations/student/:id/hadith-progress
+  // Nawawi-40 memorization map — cumulative across terms (see service).
+  @Get('student/:id/hadith-progress')
+  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
+  async getStudentHadithProgress(@Param('id') studentId: string) {
+    return this.recitationService.getStudentHadithProgress(studentId);
+  }
+
   @Get('student/:id/progress')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
   async getStudentProgress(@Param('id') studentId: string) {
