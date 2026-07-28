@@ -27,6 +27,17 @@ class StudentAttendanceEntry {
   notes?: string;
 }
 
+// Unmarking is a deletion, not a fourth status: the sheet already reads
+// "no record" as unmarked, so no existing counter or filter changes.
+export class UnmarkAttendanceDto {
+  @IsDateString()
+  date: string;
+
+  @IsArray()
+  @IsUUID(undefined, { each: true })
+  studentIds: string[];
+}
+
 export class MarkAttendanceDto {
   @IsDateString()
   date: string;

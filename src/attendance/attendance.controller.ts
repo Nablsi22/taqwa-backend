@@ -11,7 +11,10 @@ import {
   ParseUUIDPipe,
 } from '@nestjs/common';
 import { AttendanceService } from './attendance.service';
-import { MarkAttendanceDto } from './dto/mark-attendance.dto';
+import {
+  MarkAttendanceDto,
+  UnmarkAttendanceDto,
+} from './dto/mark-attendance.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -26,6 +29,15 @@ export class AttendanceController {
   @Roles('ADMIN', 'INSTRUCTOR')
   mark(@Body() dto: MarkAttendanceDto, @Request() req: any) {
     return this.attendanceService.markAttendance(dto, req.user.id);
+  }
+
+  // POST /api/v1/attendance/unmark - clear a saved attendance record.
+  // Declared before any parameterised route so Nest never resolves
+  // 'unmark' as an :id value.
+  @Post('unmark')
+  @Roles('ADMIN', 'INSTRUCTOR')
+  unmark(@Body() dto: UnmarkAttendanceDto) {
+    return this.attendanceService.unmarkAttendance(dto);
   }
 
   // GET /api/v1/attendance/sheet?date=2026-03-05&instructorId=xxx

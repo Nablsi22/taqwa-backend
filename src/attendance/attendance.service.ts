@@ -5,7 +5,10 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PointRulesService } from '../point-rules/point-rules.service';
-import { MarkAttendanceDto } from './dto/mark-attendance.dto';
+import {
+  MarkAttendanceDto,
+  UnmarkAttendanceDto,
+} from './dto/mark-attendance.dto';
 
 @Injectable()
 export class AttendanceService {
@@ -167,6 +170,47 @@ export class AttendanceService {
       message: `تم تسجيل حضور ${results.length} طالب`,
       count: results.length,
       data: results,
+    };
+  }
+
+  // ---------------------------------------------------------------
+  // UNMARK - remove an attendance record and the points it produced.
+  //
+  // Scoped per student per date through the studentId_date unique key,
+  // so no range or bulk clause can widen the blast radius. Each pair is
+  // deleted in its own transaction: the points row and the attendance
+  // row always disappear together or not at all.
+  //
+  // Already-unmarked students are skipped rather than reported as an
+  // error - the caller asked for a state, and that state already holds.
+  // ---------------------------------------------------------------
+  async unmarkAttendance(dto: UnmarkAttendanceDto) {
+    const date = new Date(dto.date);
+    let removedRecords = 0;
+    let removedPoints = 0;
+
+    for (const studentId of dto.studentIds) {
+      const existing = await this.prisma.attendance.findUnique({
+        where: { studentId_date: { studentId, date } },
+      });
+      if (!existing) continue;
+
+      const result = await this.prisma.$transaction(async (tx) => {
+        const points = await tx.pointsLog.deleteMany({
+          where: { sourceType: 'ATTENDANCE', sourceId: existing.id },
+        });
+        await tx.attendance.delete({ where: { id: existing.id } });
+        return points.count;
+      });
+
+      removedRecords += 1;
+      removedPoints += result;
+    }
+
+    return {
+      message: `unmarked ${removedRecords} record(s)`,
+      removedRecords,
+      removedPoints,
     };
   }
 
