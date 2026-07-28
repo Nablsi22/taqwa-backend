@@ -76,3 +76,5 @@ prisma/backup-restore.ts
 
 # Local timestamped backups
 *.bak
+audit-page-calculation.js
+page-audit.csv
