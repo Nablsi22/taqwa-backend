@@ -113,18 +113,36 @@ export class AttendanceService {
       // Points are stamped with sourceId = attendance record ID so
       // they can be cascaded away if the attendance is ever deleted.
       // ═══════════════════════════════════════════════════════════
-      if (!existingRecord) {
+      // A correction must move the points with it. Without this the
+      // attendance row changes while the original points row survives,
+      // leaving the student penalised for a status they no longer have.
+      const statusChanged =
+        !!existingRecord && existingRecord.status !== entry.status;
+
+      if (!existingRecord || statusChanged) {
         try {
           const ruleResult = await this.pointRulesService.getAttendancePoints(
             entry.status as 'PRESENT' | 'LATE' | 'ABSENT',
           );
 
-          if (ruleResult) {
-            const categoryId =
-              ruleResult.points >= 0 ? earnCategoryId : deductCategoryId;
+          const categoryId = ruleResult
+            ? ruleResult.points >= 0
+              ? earnCategoryId
+              : deductCategoryId
+            : null;
 
-            if (categoryId) {
-              await this.prisma.pointsLog.create({
+          // Remove-then-write in one transaction: the student is never
+          // left with two rows, nor with none because a later step threw.
+          await this.prisma.$transaction(async (tx) => {
+            if (statusChanged) {
+              // Scoped to this attendance record alone.
+              await tx.pointsLog.deleteMany({
+                where: { sourceType: 'ATTENDANCE', sourceId: record.id },
+              });
+            }
+
+            if (ruleResult && categoryId) {
+              await tx.pointsLog.create({
                 data: {
                   studentId: entry.studentId,
                   categoryId,
@@ -136,7 +154,7 @@ export class AttendanceService {
                 },
               });
             }
-          }
+          });
         } catch (e) {
           console.error('Auto-points failed for attendance:', e);
         }
