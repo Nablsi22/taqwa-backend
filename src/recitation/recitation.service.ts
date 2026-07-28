@@ -15,6 +15,7 @@ import {
 } from './dto/create-recitation.dto';
 import { CreateHadithRecitationDto } from './dto/create-hadith-recitation.dto';
 import { PointRulesService } from '../point-rules/point-rules.service';
+import { TermsService } from '../terms/terms.service';
 import {
   SURA_METADATA,
   getSuraByNumber,
@@ -71,6 +72,7 @@ export class RecitationService {
   constructor(
     private prisma: PrismaService,
     private pointRulesService: PointRulesService,
+    private termsService: TermsService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────
@@ -1097,6 +1099,94 @@ export class RecitationService {
   // loop is left untouched.
   // ─────────────────────────────────────────────────────────────────
 
+  // ---------------------------------------------------------------
+  // ROSTER METRICS
+  //
+  // Points balance, mosque-wide rank and last attendance for one
+  // instructor roster, in three grouped queries rather than three per
+  // student. Returns maps so the caller can attach values without a
+  // second pass over the data.
+  //
+  // Only the rank NUMBER crosses the wire. Computing it here rather
+  // than shipping the leaderboard to the device keeps every other
+  // student name and total on the server.
+  // ---------------------------------------------------------------
+  private async buildRosterMetrics(studentIds: string[]): Promise<{
+    points: Map<string, number>;
+    rank: Map<string, number>;
+    lastAttendance: Map<string, Date | null>;
+  }> {
+    const points = new Map<string, number>();
+    const rank = new Map<string, number>();
+    const lastAttendance = new Map<string, Date | null>();
+
+    for (const id of studentIds) {
+      points.set(id, 0);
+      lastAttendance.set(id, null);
+    }
+    if (studentIds.length === 0) {
+      return { points, rank, lastAttendance };
+    }
+
+    // Same term source as the points module. A balance shown here can
+    // therefore never disagree with the one on the points screen.
+    const activeTermId = await this.termsService.getActiveTermId();
+    const termWhere = activeTermId == null ? {} : { termId: activeTermId };
+
+    const allStudents = await this.prisma.student.findMany({
+      where: { deletedAt: null },
+      select: { id: true },
+    });
+    const allIds = allStudents.map((s) => s.id);
+
+    const grouped = await this.prisma.pointsLog.groupBy({
+      by: ['studentId'],
+      where: { ...termWhere, studentId: { in: allIds } },
+      _sum: { amount: true },
+    });
+
+    // Students with no points rows must still be ranked, so seed every
+    // active student at zero before folding in the sums.
+    const totals = new Map<string, number>();
+    for (const id of allIds) totals.set(id, 0);
+    for (const g of grouped) {
+      if (totals.has(g.studentId)) {
+        totals.set(g.studentId, Number(g._sum.amount ?? 0));
+      }
+    }
+
+    // Standard competition ranking: ties share a position and the next
+    // distinct total resumes after them (1, 2, 2, 4). Two students on
+    // equal points are never shown one above the other.
+    const sorted = [...totals.entries()].sort((a, b) => b[1] - a[1]);
+    let previousTotal: number | null = null;
+    let currentRank = 0;
+
+    sorted.forEach(([id, total], index) => {
+      if (previousTotal === null || total !== previousTotal) {
+        currentRank = index + 1;
+        previousTotal = total;
+      }
+      if (points.has(id)) {
+        points.set(id, total);
+        rank.set(id, currentRank);
+      }
+    });
+
+    // Not term-filtered on purpose: the attendance table has no term
+    // column, and "last attendance" is a historical fact.
+    const attendanceRows = await this.prisma.attendance.groupBy({
+      by: ['studentId'],
+      where: { studentId: { in: studentIds } },
+      _max: { date: true },
+    });
+    for (const row of attendanceRows) {
+      lastAttendance.set(row.studentId, row._max.date ?? null);
+    }
+
+    return { points, rank, lastAttendance };
+  }
+
   async getInstructorOverview(instructorId: string) {
     instructorId = await this.resolveInstructorId(instructorId);
 
@@ -1108,6 +1198,10 @@ export class RecitationService {
     // One round-trip for ALL last-recitations across the instructor's
     // entire roster. Avoids introducing per-student N+1 in the new code.
     const lastMap = await this.buildLastRecitationFor(
+      students.map((s) => s.id),
+    );
+
+    const metrics = await this.buildRosterMetrics(
       students.map((s) => s.id),
     );
 
@@ -1171,6 +1265,10 @@ export class RecitationService {
         homework: lastRecitation?.homework || null,
         // ◄── NEW (D2): full last-session detail. Older clients ignore it.
         lastRecitation: lastMap.get(student.id) ?? null,
+        // Additive roster metrics. Older clients ignore unknown keys.
+        pointsBalance: metrics.points.get(student.id) ?? 0,
+        mosqueRank: metrics.rank.get(student.id) ?? null,
+        lastAttendanceDate: metrics.lastAttendance.get(student.id) ?? null,
       });
     }
 
