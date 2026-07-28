@@ -70,6 +70,19 @@ export class PointsController {
   }
 
   /**
+   * GET /api/v1/points/student/:studentId/rank
+   *
+   * Returns { rank, total, totalPoints } for one student. Declared
+   * ahead of the two-segment student route so resolution order is
+   * never in question.
+   */
+  @Get('student/:studentId/rank')
+  @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT')
+  getStudentRank(@Param('studentId', ParseUUIDPipe) studentId: string) {
+    return this.pointsService.getStudentRank(studentId);
+  }
+
+  /**
    * GET /api/v1/points/student/:studentId
    * Get points history for a student
    */

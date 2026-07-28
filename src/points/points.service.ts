@@ -326,6 +326,77 @@ export class PointsService {
   // ═══════════════════════════════════════════════════════════════════════
   // LEADERBOARD — ◄── FILTERED to active term by default
   // ═══════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------
+  // MOSQUE RANKING - the single implementation
+  //
+  // Consumed by the leaderboard, the instructor roster and the student
+  // detail screen. Every caller that computes its own copy is a future
+  // disagreement about the same student, so there is deliberately only
+  // one of these.
+  //
+  // Denominator: every student with deletedAt = null. Standard
+  // competition ranking - ties share a position and the next distinct
+  // total resumes after them (1, 2, 2, 4).
+  // ---------------------------------------------------------------
+  async getMosqueRanking(termId?: number | null): Promise<{
+    totals: Map<string, number>;
+    ranks: Map<string, number>;
+    total: number;
+  }> {
+    const termWhere = await this.resolveTermWhere(termId);
+
+    const students = await this.prisma.student.findMany({
+      where: { deletedAt: null },
+      select: { id: true },
+    });
+    const ids = students.map((s) => s.id);
+
+    // Seed everyone at zero: a student with no points rows still has a
+    // rank, and omitting them would silently shrink the denominator.
+    const totals = new Map<string, number>();
+    for (const id of ids) totals.set(id, 0);
+
+    if (ids.length > 0) {
+      const grouped = await this.prisma.pointsLog.groupBy({
+        by: ['studentId'],
+        where: { ...termWhere, studentId: { in: ids } },
+        _sum: { amount: true },
+      });
+      for (const g of grouped) {
+        if (totals.has(g.studentId)) {
+          totals.set(g.studentId, Number(g._sum.amount ?? 0));
+        }
+      }
+    }
+
+    const ranks = new Map<string, number>();
+    const sorted = [...totals.entries()].sort((a, b) => b[1] - a[1]);
+    let previous: number | null = null;
+    let current = 0;
+
+    sorted.forEach(([id, total], index) => {
+      if (previous === null || total !== previous) {
+        current = index + 1;
+        previous = total;
+      }
+      ranks.set(id, current);
+    });
+
+    return { totals, ranks, total: ids.length };
+  }
+
+  // Three figures for one student, so a screen never has to download
+  // the leaderboard to display a rank.
+  async getStudentRank(studentId: string, termId?: number | null) {
+    const { totals, ranks, total } = await this.getMosqueRanking(termId);
+    return {
+      studentId,
+      rank: ranks.get(studentId) ?? null,
+      total,
+      totalPoints: totals.get(studentId) ?? 0,
+    };
+  }
+
   async getLeaderboard(params?: {
     limit?: number;
     instructorId?: string;

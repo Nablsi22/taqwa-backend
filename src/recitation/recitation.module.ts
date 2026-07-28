@@ -3,10 +3,10 @@ import { RecitationController } from './recitation.controller';
 import { RecitationService } from './recitation.service';
 import { PrismaModule } from '../prisma/prisma.module';
 import { PointRulesModule } from '../point-rules/point-rules.module';
-import { TermsModule } from '../terms/terms.module';
+import { PointsModule } from '../points/points.module';
 
 @Module({
-  imports: [PrismaModule, PointRulesModule, TermsModule],
+  imports: [PrismaModule, PointRulesModule, PointsModule],
   controllers: [RecitationController],
   providers: [RecitationService],
   exports: [RecitationService],

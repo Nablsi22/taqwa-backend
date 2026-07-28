@@ -15,7 +15,7 @@ import {
 } from './dto/create-recitation.dto';
 import { CreateHadithRecitationDto } from './dto/create-hadith-recitation.dto';
 import { PointRulesService } from '../point-rules/point-rules.service';
-import { TermsService } from '../terms/terms.service';
+import { PointsService } from '../points/points.service';
 import {
   SURA_METADATA,
   getSuraByNumber,
@@ -72,7 +72,7 @@ export class RecitationService {
   constructor(
     private prisma: PrismaService,
     private pointRulesService: PointRulesService,
-    private termsService: TermsService,
+    private pointsService: PointsService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────
@@ -1115,63 +1115,31 @@ export class RecitationService {
     points: Map<string, number>;
     rank: Map<string, number>;
     lastAttendance: Map<string, Date | null>;
+    total: number;
   }> {
     const points = new Map<string, number>();
     const rank = new Map<string, number>();
     const lastAttendance = new Map<string, Date | null>();
+    let mosqueTotal = 0;
 
     for (const id of studentIds) {
       points.set(id, 0);
       lastAttendance.set(id, null);
     }
     if (studentIds.length === 0) {
-      return { points, rank, lastAttendance };
+      return { points, rank, lastAttendance, total: 0 };
     }
 
-    // Same term source as the points module. A balance shown here can
-    // therefore never disagree with the one on the points screen.
-    const activeTermId = await this.termsService.getActiveTermId();
-    const termWhere = activeTermId == null ? {} : { termId: activeTermId };
-
-    const allStudents = await this.prisma.student.findMany({
-      where: { deletedAt: null },
-      select: { id: true },
-    });
-    const allIds = allStudents.map((s) => s.id);
-
-    const grouped = await this.prisma.pointsLog.groupBy({
-      by: ['studentId'],
-      where: { ...termWhere, studentId: { in: allIds } },
-      _sum: { amount: true },
-    });
-
-    // Students with no points rows must still be ranked, so seed every
-    // active student at zero before folding in the sums.
-    const totals = new Map<string, number>();
-    for (const id of allIds) totals.set(id, 0);
-    for (const g of grouped) {
-      if (totals.has(g.studentId)) {
-        totals.set(g.studentId, Number(g._sum.amount ?? 0));
-      }
+    // Ranking is delegated to PointsService, which owns the single
+    // implementation. A local copy here would drift from the leaderboard
+    // and from the detail screen the moment either changed.
+    const ranking = await this.pointsService.getMosqueRanking();
+    mosqueTotal = ranking.total;
+    for (const id of studentIds) {
+      points.set(id, ranking.totals.get(id) ?? 0);
+      const r = ranking.ranks.get(id);
+      if (r != null) rank.set(id, r);
     }
-
-    // Standard competition ranking: ties share a position and the next
-    // distinct total resumes after them (1, 2, 2, 4). Two students on
-    // equal points are never shown one above the other.
-    const sorted = [...totals.entries()].sort((a, b) => b[1] - a[1]);
-    let previousTotal: number | null = null;
-    let currentRank = 0;
-
-    sorted.forEach(([id, total], index) => {
-      if (previousTotal === null || total !== previousTotal) {
-        currentRank = index + 1;
-        previousTotal = total;
-      }
-      if (points.has(id)) {
-        points.set(id, total);
-        rank.set(id, currentRank);
-      }
-    });
 
     // Not term-filtered on purpose: the attendance table has no term
     // column, and "last attendance" is a historical fact.
@@ -1184,7 +1152,7 @@ export class RecitationService {
       lastAttendance.set(row.studentId, row._max.date ?? null);
     }
 
-    return { points, rank, lastAttendance };
+    return { points, rank, lastAttendance, total: mosqueTotal };
   }
 
   async getInstructorOverview(instructorId: string) {
@@ -1268,6 +1236,7 @@ export class RecitationService {
         // Additive roster metrics. Older clients ignore unknown keys.
         pointsBalance: metrics.points.get(student.id) ?? 0,
         mosqueRank: metrics.rank.get(student.id) ?? null,
+        mosqueTotal: metrics.total,
         lastAttendanceDate: metrics.lastAttendance.get(student.id) ?? null,
       });
     }
