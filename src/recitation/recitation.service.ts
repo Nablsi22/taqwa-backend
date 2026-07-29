@@ -1041,6 +1041,32 @@ export class RecitationService {
   // which reads `response.data['data']`) keeps working untouched.
   // ─────────────────────────────────────────────────────────────────
 
+  // Ayah count for one recitation row. An explicit single-sura range is
+  // authoritative; otherwise the row stands for whole suras and the
+  // count is their combined length.
+  private ayaCountOf(rec: {
+    startAya: number | null;
+    endAya: number | null;
+    startSurah: number | null;
+    endSurah: number | null;
+    surahNumbers: number[] | null;
+    surahNumber: number;
+  }): number {
+    if (
+      rec.startAya != null &&
+      rec.endAya != null &&
+      rec.startSurah != null &&
+      rec.endSurah != null &&
+      rec.startSurah === rec.endSurah
+    ) {
+      return Math.max(0, rec.endAya - rec.startAya + 1);
+    }
+    return this.surahNumsOf(rec).reduce(
+      (sum, n) => sum + (getSurahMeta(n)?.numAyas ?? 0),
+      0,
+    );
+  }
+
   async getStudentRecitations(studentId: string) {
     const [recitations, lastMap] = await Promise.all([
       this.prisma.recitation.findMany({
@@ -1050,6 +1076,27 @@ export class RecitationService {
       this.buildLastRecitationFor([studentId]),
     ]);
 
+    // What the student actually received, read from the log rather than
+    // recomputed. A third implementation of the points rules here would
+    // be a third thing to keep in step.
+    const recIds = recitations.map((r) => r.id);
+    const pointsByRecitation = new Map<string, number>();
+    if (recIds.length > 0) {
+      const grouped = await this.prisma.pointsLog.groupBy({
+        by: ['sourceId'],
+        where: {
+          sourceType: 'RECITATION',
+          sourceId: { in: recIds },
+        },
+        _sum: { amount: true },
+      });
+      for (const g of grouped) {
+        if (g.sourceId) {
+          pointsByRecitation.set(g.sourceId, Number(g._sum.amount ?? 0));
+        }
+      }
+    }
+
     const data = recitations.map((rec) => {
       const surahNums = this.surahNumsOf(rec);
       const suraNames = surahNums.map((n) => getSuraName(n));
@@ -1058,11 +1105,43 @@ export class RecitationService {
         surahNumbers: surahNums,
         suraName: suraNames.join('، '),
         suraNames,
+        pointsAwarded: pointsByRecitation.get(rec.id) ?? 0,
+        ayaCount: this.ayaCountOf(rec),
       };
     });
 
+    // Nawawi entries so the client can lay Quran and hadith on one
+    // timeline. hadith_recitations has no calendar date column, only
+    // createdAt, so these group by the day they were recorded.
+    const hadithRows = await this.prisma.hadithRecitation.findMany({
+      where: { studentId },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const hadithTitles = new Map<number, string | null>();
+    if (hadithRows.length > 0) {
+      const rules = await this.prisma.hadithPointsRule.findMany({
+        where: {
+          hadithNumber: { in: hadithRows.map((h) => h.hadithNumber) },
+        },
+        select: { hadithNumber: true, title: true },
+      });
+      for (const r of rules) {
+        hadithTitles.set(r.hadithNumber, r.title);
+      }
+    }
+
+    const hadithEntries = hadithRows.map((h) => ({
+      id: h.id,
+      hadithNumber: h.hadithNumber,
+      title: hadithTitles.get(h.hadithNumber) ?? null,
+      pointsAwarded: h.pointsAwarded,
+      createdAt: h.createdAt,
+    }));
+
     return {
       data,
+      hadithEntries,
       lastRecitation: lastMap.get(studentId) ?? null,
     };
   }
