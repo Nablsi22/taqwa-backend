@@ -78,3 +78,5 @@ prisma/backup-restore.ts
 *.bak
 audit-page-calculation.js
 page-audit.csv
+
+_backups/

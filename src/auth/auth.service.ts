@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import * as bcrypt from 'bcrypt';
 import { LoginDto } from './dto/login.dto';
 
+import { resolveTtl } from './jwt-ttl.util';
 @Injectable()
 export class AuthService {
   constructor(
@@ -48,12 +49,12 @@ export class AuthService {
 
     const accessToken = this.jwt.sign(payload, {
       secret: this.config.get('JWT_SECRET'),
-      expiresIn: '15m',
+      expiresIn: resolveTtl(this.config.get<string>('JWT_ACCESS_TTL'), '15m'),
     });
 
     const refreshToken = this.jwt.sign(payload, {
       secret: this.config.get('JWT_REFRESH_SECRET'),
-      expiresIn: '7d',
+      expiresIn: resolveTtl(this.config.get<string>('JWT_REFRESH_TTL'), '180d'),
     });
 
     // Build profile based on role
@@ -108,11 +109,11 @@ export class AuthService {
       return {
         accessToken: this.jwt.sign(newPayload, {
           secret: this.config.get('JWT_SECRET'),
-          expiresIn: '15m',
+          expiresIn: resolveTtl(this.config.get<string>('JWT_ACCESS_TTL'), '15m'),
         }),
         refreshToken: this.jwt.sign(newPayload, {
           secret: this.config.get('JWT_REFRESH_SECRET'),
-          expiresIn: '7d',
+          expiresIn: resolveTtl(this.config.get<string>('JWT_REFRESH_TTL'), '180d'),
         }),
       };
     } catch {
