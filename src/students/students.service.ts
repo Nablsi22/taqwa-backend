@@ -16,19 +16,74 @@ import {
   hashPassword,
 } from './credentials.util';
 
+/**
+ * Lifecycle filter for the admin roster.
+ *   active   → deletedAt IS NULL   (default; preserves the previous behaviour)
+ *   inactive → deletedAt IS NOT NULL
+ *   all      → no lifecycle predicate
+ */
+export type StudentStatusFilter = 'active' | 'inactive' | 'all';
+
+export interface FindStudentsParams {
+  search?: string;
+  instructorId?: string;
+  grade?: string;
+  status?: StudentStatusFilter;
+  minAge?: number;
+  maxAge?: number;
+  minJuz?: number;
+  maxJuz?: number;
+  page?: number;
+  limit?: number;
+  all?: boolean;
+  termId?: number | null;
+}
+
 @Injectable()
 export class StudentsService {
+  // ═══════════════════════════════════════════════════════════════════════
+  // CANONICAL GRADE ORDER
+  //
+  // `Student.grade` is a free-text column, but a production audit of all 170
+  // non-deleted rows found exactly these 12 values, with zero NULLs and zero
+  // whitespace variants. The order below is pedagogical, not alphabetical:
+  // Arabic collation would sort "الثامن" before "الثاني", which is wrong.
+  //
+  // Any value not on this list still surfaces in the filter options — it is
+  // appended after the known grades rather than dropped, so a typo entered
+  // through the admin form stays visible instead of silently disappearing.
+  // ═══════════════════════════════════════════════════════════════════════
+  private static readonly GRADE_ORDER: readonly string[] = [
+    'الأول',
+    'الثاني',
+    'الثالث',
+    'الرابع',
+    'الخامس',
+    'السادس',
+    'السابع',
+    'الثامن',
+    'التاسع',
+    'العاشر',
+    'الحادي عشر',
+    'الثاني عشر',
+  ];
+
+  // One juz is treated as 20 mushaf pages (604 pages / 30 juz ≈ 20.13).
+  // This is a display-level bucket for filtering only; it is never persisted
+  // and never feeds the points formula.
+  private static readonly PAGES_PER_JUZ = 20;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly termsService: TermsService,
   ) {}
 
-  // ═══════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   // TERM FILTER HELPER — same semantics as PointsService:
   //   undefined → active term (default for students)
   //   0         → all terms (admin view)
   //   >0        → that specific term
-  // ═══════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   private async resolveTermWhere(
     explicit?: number | null,
   ): Promise<Prisma.PointsLogWhereInput> {
@@ -39,6 +94,142 @@ export class StudentsService {
     const active = await this.termsService.getActiveTermId();
     if (active == null) return {};
     return { termId: active };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AGE → DATE-OF-BIRTH RANGE
+  //
+  // Filtering is translated into a bounded range on `dateOfBirth` rather than
+  // computing each student's age row by row. That keeps the predicate a plain
+  // indexable comparison and, more importantly, keeps it correct: an age
+  // computed in application code would drift as the process stays up across
+  // midnight, whereas the bounds here are derived once per request.
+  //
+  //   age >= minAge  ⇔  dateOfBirth <= today − minAge years
+  //   age <= maxAge  ⇔  dateOfBirth >  today − (maxAge + 1) years
+  //
+  // The upper bound is exclusive because someone who turns (maxAge + 1)
+  // exactly today is no longer within the range.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private dobRangeForAges(
+    minAge?: number,
+    maxAge?: number,
+  ): Prisma.DateTimeFilter | undefined {
+    if (minAge == null && maxAge == null) return undefined;
+
+    const today = new Date();
+    const shiftYears = (years: number): Date =>
+      new Date(
+        Date.UTC(
+          today.getUTCFullYear() - years,
+          today.getUTCMonth(),
+          today.getUTCDate(),
+        ),
+      );
+
+    const filter: Prisma.DateTimeFilter = {};
+    if (minAge != null) filter.lte = shiftYears(minAge);
+    if (maxAge != null) filter.gt = shiftYears(maxAge + 1);
+
+    return filter;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MEMORISATION VOLUME → STUDENT IDs
+  //
+  // Recited volume is not a column on Student; it only exists as the sum of
+  // that student's `recitations` rows. It therefore cannot be expressed as a
+  // Prisma `where` predicate, so the qualifying IDs are resolved first and fed
+  // back in as `id: { in: [...] }`. Doing it this way — rather than filtering
+  // the page after it is fetched — keeps pagination and the total count
+  // honest: page 2 means the second page of *matching* students.
+  //
+  // ── Why this aggregates in TypeScript rather than in SQL ──
+  //
+  // The per-row value is `pagesCalculated` when present, falling back to
+  // `pagesRecited`. In SQL that is a COALESCE, but the `recitations` table
+  // mixes naming conventions: older fields carry an explicit @map to
+  // snake_case (`pages_recited`) while newer ones were added without it and
+  // are therefore quoted camelCase columns (`"pagesCalculated"`). Hand-written
+  // SQL against this table is a standing hazard — the wrong guess fails at
+  // runtime, not at compile time. Letting Prisma generate the column names
+  // removes that class of bug entirely.
+  //
+  // The cost is fetching the recitation rows (1,845 at the time of writing,
+  // three narrow columns) instead of aggregating server-side. At this scale
+  // that is negligible, and it stays negligible for years at the current
+  // growth rate. If the table ever reaches the point where it isn't, the fix
+  // is a stored aggregate on Student, not a return to raw SQL.
+  //
+  // ⚠ CAVEAT 1 — this sums every recitation, so re-reciting the same page
+  // counts each time. It measures cumulative recited volume, not distinct
+  // Quran coverage. Distinct coverage would require interval-merging the aya
+  // ranges per student; that is materially larger work and is not what this
+  // filter claims to be.
+  //
+  // ⚠ CAVEAT 2 — roughly half the rows predate `pagesCalculated` and fall back
+  // to `pagesRecited`, which is derived from the curated metadata table known
+  // to overstate the mushaf by about 6% (639.75 vs 604 pages). A student's
+  // total therefore mixes two methods and skews slightly high. Acceptable for
+  // a browsing filter; not acceptable as a reported figure.
+  //
+  // The aggregate is deliberately NOT term-scoped: memorisation accumulates
+  // across terms, unlike points.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async studentIdsByJuzRange(
+    minJuz?: number,
+    maxJuz?: number,
+  ): Promise<string[] | null> {
+    if (minJuz == null && maxJuz == null) return null;
+
+    const minPages =
+      minJuz != null ? minJuz * StudentsService.PAGES_PER_JUZ : null;
+    const maxPages =
+      maxJuz != null ? (maxJuz + 1) * StudentsService.PAGES_PER_JUZ : null;
+
+    const [recitations, everyStudent] = await Promise.all([
+      this.prisma.recitation.findMany({
+        select: {
+          studentId: true,
+          pagesRecited: true,
+          pagesCalculated: true,
+        },
+      }),
+      this.prisma.student.findMany({ select: { id: true } }),
+    ]);
+
+    const pagesByStudent = new Map<string, number>();
+    for (const row of recitations) {
+      // pagesCalculated is Decimal(5,3) and arrives as a Prisma.Decimal —
+      // Number() is mandatory, an implicit cast yields NaN.
+      const pages =
+        row.pagesCalculated != null
+          ? Number(row.pagesCalculated)
+          : Number(row.pagesRecited ?? 0);
+
+      if (!Number.isFinite(pages)) continue;
+
+      pagesByStudent.set(
+        row.studentId,
+        (pagesByStudent.get(row.studentId) ?? 0) + pages,
+      );
+    }
+
+    // Students with no recitations at all are absent from the map but still
+    // have a legitimate total of zero, so they are evaluated too.
+    return everyStudent
+      .map((s) => s.id)
+      .filter((id) => {
+        const pages = pagesByStudent.get(id) ?? 0;
+        if (minPages != null && pages < minPages) return false;
+        if (maxPages != null && pages >= maxPages) return false;
+        return true;
+      });
+  }
+
+  private static gradeSortIndex(grade: string): number {
+    const index = StudentsService.GRADE_ORDER.indexOf(grade);
+    return index === -1 ? Number.MAX_SAFE_INTEGER : index;
   }
 
   async create(dto: CreateStudentDto, createdByUserId: string) {
@@ -93,27 +284,40 @@ export class StudentsService {
     };
   }
 
-  async findAll(params?: {
-    search?: string;
-    instructorId?: string;
-    page?: number;
-    limit?: number;
-    all?: boolean;
-    termId?: number | null; // NEW
-  }) {
-    const { search, instructorId, all = false, termId } = params || {};
-    const page  = Math.max(1, params?.page ?? 1);
-    const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
-    const skip  = (page - 1) * limit;
+  async findAll(params?: FindStudentsParams) {
+    const {
+      search,
+      instructorId,
+      grade,
+      status = 'active',
+      minAge,
+      maxAge,
+      minJuz,
+      maxJuz,
+      all = false,
+      termId,
+    } = params || {};
 
-    const where: Prisma.StudentWhereInput = { deletedAt: null };
+    const page = Math.max(1, params?.page ?? 1);
+    const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.StudentWhereInput = {};
+
+    // Lifecycle. 'active' reproduces the previous unconditional behaviour,
+    // so every existing caller that omits `status` is unaffected.
+    if (status === 'active') {
+      where.deletedAt = null;
+    } else if (status === 'inactive') {
+      where.deletedAt = { not: null };
+    }
 
     if (search) {
       where.OR = [
-        { fullName:   { contains: search, mode: 'insensitive' } },
+        { fullName: { contains: search, mode: 'insensitive' } },
         { fatherName: { contains: search, mode: 'insensitive' } },
-        { phone1:     { contains: search } },
-        { phone2:     { contains: search } },
+        { phone1: { contains: search } },
+        { phone2: { contains: search } },
       ];
     }
 
@@ -121,13 +325,27 @@ export class StudentsService {
       where.instructorId = instructorId;
     }
 
+    if (grade) {
+      where.grade = grade;
+    }
+
+    const dobRange = this.dobRangeForAges(minAge, maxAge);
+    if (dobRange) {
+      where.dateOfBirth = dobRange;
+    }
+
+    const juzFilteredIds = await this.studentIdsByJuzRange(minJuz, maxJuz);
+    if (juzFilteredIds !== null) {
+      where.id = { in: juzFilteredIds };
+    }
+
     const findManyArgs: Prisma.StudentFindManyArgs = {
       where,
       orderBy: { fullName: 'asc' },
       include: {
-        user:       { select: { username: true } },
+        user: { select: { username: true } },
         instructor: { include: { user: { select: { username: true } } } },
-        _count:     { select: { attendance: true, pointsLog: true } },
+        _count: { select: { attendance: true, pointsLog: true } },
       },
       ...(all ? { take: 2000 } : { skip, take: limit }),
     };
@@ -181,9 +399,91 @@ export class StudentsService {
       data: studentsWithPoints,
       meta: {
         total,
-        page:       all ? 1 : page,
-        limit:      all ? total : limit,
+        page: all ? 1 : page,
+        limit: all ? total : limit,
         totalPages: all ? 1 : Math.ceil(total / limit),
+        // Echo the filters back so the client can render active-filter chips
+        // without having to keep its own copy in sync.
+        filters: {
+          search: search ?? null,
+          instructorId: instructorId ?? null,
+          grade: grade ?? null,
+          status,
+          minAge: minAge ?? null,
+          maxAge: maxAge ?? null,
+          minJuz: minJuz ?? null,
+          maxJuz: maxJuz ?? null,
+        },
+      },
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FILTER OPTIONS — drives the admin filter bar.
+  //
+  // The grade list is derived from the data rather than hard-coded in Flutter,
+  // so a grade that stops being used disappears from the dropdown on its own
+  // and a newly introduced one appears without shipping an APK.
+  //
+  // Instructor counts come from a groupBy on Student rather than a relation
+  // `_count` on Instructor, because the latter would also count soft-deleted
+  // students and quietly overstate every حلقة.
+  // ═══════════════════════════════════════════════════════════════════════════
+  async getFilterOptions() {
+    const [gradeGroups, instructorGroups, instructors, total] =
+      await Promise.all([
+        this.prisma.student.groupBy({
+          by: ['grade'],
+          where: { deletedAt: null },
+          _count: { _all: true },
+        }),
+        this.prisma.student.groupBy({
+          by: ['instructorId'],
+          where: { deletedAt: null },
+          _count: { _all: true },
+        }),
+        this.prisma.instructor.findMany({
+          select: { id: true, fullName: true },
+          orderBy: { fullName: 'asc' },
+        }),
+        this.prisma.student.count({ where: { deletedAt: null } }),
+      ]);
+
+    const grades = gradeGroups
+      .filter((g) => g.grade != null && g.grade.trim() !== '')
+      .map((g) => ({
+        value: g.grade as string,
+        count: g._count._all,
+      }))
+      .sort(
+        (a, b) =>
+          StudentsService.gradeSortIndex(a.value) -
+            StudentsService.gradeSortIndex(b.value) ||
+          a.value.localeCompare(b.value, 'ar'),
+      );
+
+    const missingGrade = gradeGroups
+      .filter((g) => g.grade == null || g.grade.trim() === '')
+      .reduce((sum, g) => sum + g._count._all, 0);
+
+    const countsByInstructor = new Map<string, number>();
+    for (const row of instructorGroups) {
+      countsByInstructor.set(row.instructorId, row._count._all);
+    }
+
+    return {
+      grades,
+      instructors: instructors.map((i) => ({
+        id: i.id,
+        fullName: i.fullName,
+        count: countsByInstructor.get(i.id) ?? 0,
+      })),
+      meta: {
+        total,
+        // Non-zero here means the admin form let a student through without a
+        // grade; the filter bar can surface it as a data-quality warning.
+        missingGrade,
+        pagesPerJuz: StudentsService.PAGES_PER_JUZ,
       },
     };
   }
@@ -194,7 +494,7 @@ export class StudentsService {
     const student = await this.prisma.student.findUnique({
       where: { id },
       include: {
-        user:       { select: { username: true } },
+        user: { select: { username: true } },
         instructor: { include: { user: { select: { username: true } } } },
         attendance: {
           orderBy: { date: 'desc' },
@@ -270,15 +570,15 @@ export class StudentsService {
     return this.prisma.student.update({
       where: { id },
       data: {
-        ...(dto.fullName    && { fullName:    dto.fullName }),
-        ...(dto.fatherName  && { fatherName:  dto.fatherName }),
+        ...(dto.fullName && { fullName: dto.fullName }),
+        ...(dto.fatherName && { fatherName: dto.fatherName }),
         ...(dto.dateOfBirth && { dateOfBirth: new Date(dto.dateOfBirth) }),
         ...(dto.instructorId && { instructorId: dto.instructorId }),
-        ...(dto.school   !== undefined && { school:   dto.school }),
-        ...(dto.address  !== undefined && { address:  dto.address }),
-        ...(dto.phone1   !== undefined && { phone1:   dto.phone1 }),
-        ...(dto.phone2   !== undefined && { phone2:   dto.phone2 }),
-        ...(dto.grade    !== undefined && { grade:    dto.grade }),
+        ...(dto.school !== undefined && { school: dto.school }),
+        ...(dto.address !== undefined && { address: dto.address }),
+        ...(dto.phone1 !== undefined && { phone1: dto.phone1 }),
+        ...(dto.phone2 !== undefined && { phone2: dto.phone2 }),
+        ...(dto.grade !== undefined && { grade: dto.grade }),
       },
       include: {
         instructor: { include: { user: { select: { username: true } } } },
@@ -372,9 +672,9 @@ export class StudentsService {
     };
   }
 
-  // ─────────────────────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────────────────────
   // CREDENTIALS MANAGEMENT (unchanged)
-  // ─────────────────────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────────────────────
 
   async listCredentials(params?: {
     search?: string;
@@ -387,9 +687,9 @@ export class StudentsService {
     if (search) {
       where.OR = [
         { fullName: { contains: search, mode: 'insensitive' } },
-        { phone1:   { contains: search } },
-        { phone2:   { contains: search } },
-        { user:     { username: { contains: search } } },
+        { phone1: { contains: search } },
+        { phone2: { contains: search } },
+        { user: { username: { contains: search } } },
       ];
     }
 
@@ -410,7 +710,7 @@ export class StudentsService {
         credentialsSentAt: true,
         lastCredentialReset: true,
         instructor: { select: { fullName: true } },
-        user:       { select: { username: true } },
+        user: { select: { username: true } },
       },
     });
 
@@ -426,8 +726,8 @@ export class StudentsService {
         lastCredentialReset: s.lastCredentialReset,
       })),
       meta: {
-        total:  students.length,
-        sent:   students.filter((s) => s.credentialsSentAt != null).length,
+        total: students.length,
+        sent: students.filter((s) => s.credentialsSentAt != null).length,
         unsent: students.filter((s) => s.credentialsSentAt == null).length,
       },
     };
