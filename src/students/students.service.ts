@@ -33,6 +33,7 @@ export interface FindStudentsParams {
   maxAge?: number;
   minJuz?: number;
   maxJuz?: number;
+  includePages?: boolean;
   page?: number;
   limit?: number;
   all?: boolean;
@@ -135,14 +136,10 @@ export class StudentsService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MEMORISATION VOLUME → STUDENT IDs
+  // RECITED PAGES PER STUDENT
   //
   // Recited volume is not a column on Student; it only exists as the sum of
-  // that student's `recitations` rows. It therefore cannot be expressed as a
-  // Prisma `where` predicate, so the qualifying IDs are resolved first and fed
-  // back in as `id: { in: [...] }`. Doing it this way — rather than filtering
-  // the page after it is fetched — keeps pagination and the total count
-  // honest: page 2 means the second page of *matching* students.
+  // that student's `recitations` rows.
   //
   // ── Why this aggregates in TypeScript rather than in SQL ──
   //
@@ -157,24 +154,67 @@ export class StudentsService {
   //
   // The cost is fetching the recitation rows (1,845 at the time of writing,
   // three narrow columns) instead of aggregating server-side. At this scale
-  // that is negligible, and it stays negligible for years at the current
-  // growth rate. If the table ever reaches the point where it isn't, the fix
-  // is a stored aggregate on Student, not a return to raw SQL.
+  // that is negligible. If the table ever grows past the point where it isn't,
+  // the fix is a stored aggregate on Student, not a return to raw SQL.
   //
   // ⚠ CAVEAT 1 — this sums every recitation, so re-reciting the same page
   // counts each time. It measures cumulative recited volume, not distinct
   // Quran coverage. Distinct coverage would require interval-merging the aya
   // ranges per student; that is materially larger work and is not what this
-  // filter claims to be.
+  // number claims to be.
   //
   // ⚠ CAVEAT 2 — roughly half the rows predate `pagesCalculated` and fall back
-  // to `pagesRecited`, which is derived from the curated metadata table known
-  // to overstate the mushaf by about 6% (639.75 vs 604 pages). A student's
-  // total therefore mixes two methods and skews slightly high. Acceptable for
-  // a browsing filter; not acceptable as a reported figure.
+  // to `pagesRecited`, which derives from the curated metadata table known to
+  // overstate the mushaf by about 6% (639.75 vs 604 pages). A student's total
+  // therefore mixes two methods and skews slightly high. Acceptable for a
+  // browsing filter; NOT acceptable as a figure reported to families.
   //
-  // The aggregate is deliberately NOT term-scoped: memorisation accumulates
-  // across terms, unlike points.
+  // Deliberately NOT term-scoped: memorisation accumulates across terms,
+  // unlike points.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async recitedPagesByStudent(
+    studentIds?: string[],
+  ): Promise<Map<string, number>> {
+    const recitations = await this.prisma.recitation.findMany({
+      where: studentIds ? { studentId: { in: studentIds } } : undefined,
+      select: {
+        studentId: true,
+        pagesRecited: true,
+        pagesCalculated: true,
+      },
+    });
+
+    const totals = new Map<string, number>();
+    for (const row of recitations) {
+      // pagesCalculated is Decimal(5,3) and arrives as a Prisma.Decimal —
+      // Number() is mandatory, an implicit cast yields NaN.
+      const pages =
+        row.pagesCalculated != null
+          ? Number(row.pagesCalculated)
+          : Number(row.pagesRecited ?? 0);
+
+      if (!Number.isFinite(pages)) continue;
+
+      totals.set(row.studentId, (totals.get(row.studentId) ?? 0) + pages);
+    }
+
+    // Round to the precision of the underlying Decimal(5,3) column. Summing
+    // doubles otherwise surfaces totals such as 40.00000000000001.
+    for (const [id, sum] of totals) {
+      totals.set(id, Math.round(sum * 1000) / 1000);
+    }
+
+    return totals;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // JUZ RANGE → STUDENT IDs
+  //
+  // Recited volume cannot be expressed as a Prisma `where` predicate, so the
+  // qualifying IDs are resolved first and fed back in as `id: { in: [...] }`.
+  // Doing it this way — rather than filtering the page after it is fetched —
+  // keeps pagination and the total count honest: page 2 means the second page
+  // of *matching* students.
   // ═══════════════════════════════════════════════════════════════════════════
   private async studentIdsByJuzRange(
     minJuz?: number,
@@ -187,33 +227,10 @@ export class StudentsService {
     const maxPages =
       maxJuz != null ? (maxJuz + 1) * StudentsService.PAGES_PER_JUZ : null;
 
-    const [recitations, everyStudent] = await Promise.all([
-      this.prisma.recitation.findMany({
-        select: {
-          studentId: true,
-          pagesRecited: true,
-          pagesCalculated: true,
-        },
-      }),
+    const [pagesByStudent, everyStudent] = await Promise.all([
+      this.recitedPagesByStudent(),
       this.prisma.student.findMany({ select: { id: true } }),
     ]);
-
-    const pagesByStudent = new Map<string, number>();
-    for (const row of recitations) {
-      // pagesCalculated is Decimal(5,3) and arrives as a Prisma.Decimal —
-      // Number() is mandatory, an implicit cast yields NaN.
-      const pages =
-        row.pagesCalculated != null
-          ? Number(row.pagesCalculated)
-          : Number(row.pagesRecited ?? 0);
-
-      if (!Number.isFinite(pages)) continue;
-
-      pagesByStudent.set(
-        row.studentId,
-        (pagesByStudent.get(row.studentId) ?? 0) + pages,
-      );
-    }
 
     // Students with no recitations at all are absent from the map but still
     // have a legitimate total of zero, so they are evaluated too.
@@ -294,6 +311,7 @@ export class StudentsService {
       maxAge,
       minJuz,
       maxJuz,
+      includePages = false,
       all = false,
       termId,
     } = params || {};
@@ -390,9 +408,19 @@ export class StudentsService {
       totalsByStudent.set(row.studentId, Number(row._sum.amount ?? 0));
     }
 
+    // Opt-in: recited page totals, scoped to the returned page of students so
+    // the default roster load pays nothing for a field it does not use.
+    const pagesByStudent =
+      includePages && studentIds.length
+        ? await this.recitedPagesByStudent(studentIds)
+        : null;
+
     const studentsWithPoints = students.map((student) => ({
       ...student,
       totalPoints: totalsByStudent.get(student.id) ?? 0,
+      ...(pagesByStudent
+        ? { totalPagesRecited: pagesByStudent.get(student.id) ?? 0 }
+        : {}),
     }));
 
     return {
@@ -414,6 +442,7 @@ export class StudentsService {
           minJuz: minJuz ?? null,
           maxJuz: maxJuz ?? null,
         },
+        pagesPerJuz: StudentsService.PAGES_PER_JUZ,
       },
     };
   }

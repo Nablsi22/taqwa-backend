@@ -34,6 +34,7 @@ interface FindStudentsQuery {
   maxAge?: string;
   minJuz?: string;
   maxJuz?: string;
+  includePages?: string;
   page?: string;
   limit?: string;
   all?: string;
@@ -78,29 +79,44 @@ function parseBooleanFlag(raw?: string): boolean {
 export class StudentsController {
   constructor(private readonly studentsService: StudentsService) {}
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ADMIN-ONLY: student creation.
+  //
+  // Enrolment — including which حلقة a student is assigned to — is an
+  // administrative decision. Instructors previously had this permission but
+  // never a UI for it: add_student_screen.dart is imported only by admin
+  // screens, so narrowing the role breaks no existing client.
+  // ═══════════════════════════════════════════════════════════════════════════
   @Post()
-  @Roles('ADMIN', 'INSTRUCTOR')
+  @Roles('ADMIN')
   create(@Body() dto: CreateStudentDto, @Request() req: any) {
     return this.studentsService.create(dto, req.user.id);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ROSTER — every filter parameter is optional and additive.
+  // ADMIN-ONLY: mosque-wide roster and filters.
   //
-  // With no parameters the response is byte-for-byte what it was before this
-  // change (status defaults to 'active', which is the old hard-coded
-  // `deletedAt: null`), so no existing client needs to be updated in step.
+  // This endpoint returns every student in the mosque regardless of حلقة, so
+  // an instructor calling it would see students who are not theirs. Rather
+  // than scoping results per instructor, the route is closed to admins
+  // outright — instructors have no screen that lists all students. Their only
+  // use of this controller is GET /students/:id for a single student they are
+  // already viewing, which remains open below.
   //
-  // Supported:
+  // Every filter parameter is optional and additive. With none supplied the
+  // response is what it was before filters existed (status defaults to
+  // 'active', the old hard-coded `deletedAt: null`).
+  //
   //   ?grade=السابع              exact match on the free-text grade column
   //   ?instructorId=<uuid>        حلقة
   //   ?status=active|inactive|all lifecycle
   //   ?minAge=10&maxAge=12        inclusive age range, both ends optional
   //   ?minJuz=1&maxJuz=5          inclusive juz range of recited volume
+  //   ?includePages=true          attach totalPagesRecited to each student
   //   ?termId=0                   0 = all terms, >0 = specific, absent = active
   // ═══════════════════════════════════════════════════════════════════════════
   @Get()
-  @Roles('ADMIN', 'INSTRUCTOR')
+  @Roles('ADMIN')
   findAll(@Query() query: FindStudentsQuery) {
     const status = optionalString(query.status) as
       | StudentStatusFilter
@@ -133,6 +149,7 @@ export class StudentsController {
       maxAge,
       minJuz,
       maxJuz,
+      includePages: parseBooleanFlag(query.includePages),
       page: optionalInt(query.page, 'page') ?? 1,
       limit: optionalInt(query.limit, 'limit') ?? 50,
       all: parseBooleanFlag(query.all),
@@ -144,12 +161,12 @@ export class StudentsController {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // FILTER OPTIONS — admin-only
+  // FILTER OPTIONS — admin-only, mosque-wide by definition.
   // STATIC ROUTES MUST COME BEFORE :id ROUTES
   // ═══════════════════════════════════════════════════════════════════════════
 
   @Get('filters/options')
-  @Roles('ADMIN', 'INSTRUCTOR')
+  @Roles('ADMIN')
   getFilterOptions() {
     return this.studentsService.getFilterOptions();
   }
@@ -191,7 +208,11 @@ export class StudentsController {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STUDENT-SPECIFIC ROUTES — must come AFTER static routes
+  // STUDENT-SPECIFIC ROUTES — must come AFTER static routes.
+  //
+  // These stay open to instructors: instructor_student_detail_screen.dart
+  // depends on GET /students/:id, and the detail screen is reached from a
+  // student the instructor is already working with.
   // ═══════════════════════════════════════════════════════════════════════════
 
   @Get(':id')
