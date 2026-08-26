@@ -80,3 +80,6 @@ audit-page-calculation.js
 page-audit.csv
 
 _backups/
+
+exports/
+*.csv

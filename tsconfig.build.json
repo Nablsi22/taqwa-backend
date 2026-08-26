@@ -11,6 +11,7 @@
     "**/*spec.ts",
     "seed-instructor.ts",
     "seed*.ts",
-    "prisma/**/*.ts"
+    "prisma/**/*.ts",
+    "scripts/**/*.ts"
   ]
 }

@@ -1,0 +1,206 @@
+/**
+ * page-audit.ts — تقرير أثر توحيد حساب الصفحات.
+ *
+ * READ-ONLY: لا يُنفّذ أي INSERT / UPDATE / DELETE.
+ * يستخدم calculatePages نفسها المستعملة في الإنتاج — لا نسخة مستقلة —
+ * فلا فجوة بين ما يقيسه التقرير وما سينفّذه التصحيح لاحقاً.
+ *
+ * التشغيل:
+ *   $env:AUDIT_DATABASE_URL = '<DATABASE_PUBLIC_URL>'
+ *   npx ts-node scripts/page-audit.ts
+ */
+import { PrismaClient, Prisma } from '@prisma/client';
+import * as fs from 'fs';
+import {
+  calculatePages,
+  getSurahMeta,
+} from '../src/quran-metadata/quran-ayat-pages.util';
+
+const url = process.env.AUDIT_DATABASE_URL;
+if (!url) throw new Error('ABORT: AUDIT_DATABASE_URL is not set.');
+if (/railway\.internal/.test(url)) {
+  throw new Error('ABORT: internal host — use DATABASE_PUBLIC_URL.');
+}
+
+const prisma = new PrismaClient({ datasources: { db: { url } } });
+
+const num = (v: Prisma.Decimal | number | null | undefined): number =>
+  v == null ? 0 : Number(v);
+
+interface RuleSet {
+  [code: string]: {
+    points: number;
+    isActive: boolean;
+    isPerPage: boolean;
+    minPages: number | null;
+  };
+}
+
+/** إعادة تطبيق منطق point-rules.service.ts:128-185 حرفياً. */
+function computePoints(rating: string, pages: number, rules: RuleSet): number {
+  if (!rating || rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE') return 0;
+  if (pages <= 0) return 0;
+
+  if (rating === 'MAQRAA') {
+    const r = rules['RECITE_MAQRAA'];
+    if (!r?.isActive) return 0;
+    return r.isPerPage ? r.points * pages : r.points;
+  }
+
+  if (pages >= 5) {
+    const b = rules['RECITE_5PLUS_PAGES'];
+    if (b?.isActive && b.minPages && pages >= b.minPages) {
+      return b.points * pages;
+    }
+  }
+
+  const code = { GOOD: 'RECITE_GOOD', VERY_GOOD: 'RECITE_VERY_GOOD' }[rating];
+  if (!code) return 0;
+  const r = rules[code];
+  return r?.isActive ? r.points * pages : 0;
+}
+
+/** الصفحات الدقيقة لسورة كاملة، بنفس خوارزمية وضع الآيات. */
+function precisePagesForFullSura(n: number): number {
+  const meta = getSurahMeta(n);
+  if (!meta) return 0;
+  return calculatePages(n, 1, n, meta.numAyas);
+}
+
+async function main() {
+  const ruleRows = await prisma.pointRule.findMany();
+  const rules: RuleSet = {};
+  for (const r of ruleRows) {
+    rules[r.code] = {
+      points: num(r.points),
+      isActive: r.isActive,
+      isPerPage: (r as any).isPerPage ?? false,
+      minPages: (r as any).minPages ?? null,
+    };
+  }
+
+  // اكتشاف قيم sourceType الفعلية بدل تخمينها
+  const kinds = await prisma.pointsLog.groupBy({
+    by: ['sourceType'],
+    _count: { _all: true },
+  });
+  console.log('\n=== sourceType distribution in points_log ===');
+  for (const k of kinds) console.log(`  ${k.sourceType ?? '(null)'}: ${k._count._all}`);
+
+  const recitations = await prisma.recitation.findMany({
+    include: { student: { select: { fullName: true, fatherName: true } } },
+  });
+  console.log(`\nrecitations: ${recitations.length}`);
+
+  const logs = await prisma.pointsLog.findMany({
+    where: { sourceId: { in: recitations.map((r) => r.id) } },
+    select: { sourceId: true, amount: true },
+  });
+  const logged = new Map<string, number>();
+  for (const l of logs) {
+    if (!l.sourceId) continue;
+    logged.set(l.sourceId, (logged.get(l.sourceId) ?? 0) + num(l.amount));
+  }
+
+  interface Row {
+    student: string;
+    termId: number | null;
+    current: number;
+    corrected: number;
+    affected: number;
+  }
+  const byStudent = new Map<string, Row>();
+  const details: string[] = [
+    'recitation_id,student,term,mode,pages_old,pages_new,points_old,points_new,delta',
+  ];
+  let skipped = 0;
+
+  for (const rec of recitations) {
+    const oldPages = num(rec.pagesRecited);
+    let newPages: number;
+    let mode: string;
+
+    if (rec.isCompleteSura) {
+      const list = rec.surahNumbers?.length ? rec.surahNumbers : [rec.surahNumber];
+      newPages = list.reduce((s, n) => s + precisePagesForFullSura(n), 0);
+      mode = 'full_sura';
+    } else if (rec.startSurah && rec.startAya && rec.endSurah && rec.endAya) {
+      newPages = calculatePages(rec.startSurah, rec.startAya, rec.endSurah, rec.endAya);
+      mode = 'aya_range';
+    } else {
+      newPages = oldPages; // لا بيانات كافية — يُترك كما هو
+      mode = 'legacy_unknown';
+      skipped++;
+    }
+
+    newPages = Math.round(newPages * 1000) / 1000;
+
+    const oldPts = logged.has(rec.id)
+      ? logged.get(rec.id)!
+      : computePoints(rec.rating, oldPages, rules);
+    const newPts = Math.round(computePoints(rec.rating, newPages, rules) * 1000) / 1000;
+    const delta = Math.round((newPts - oldPts) * 1000) / 1000;
+
+    const name = `${rec.student.fullName} ${rec.student.fatherName ?? ''}`.trim();
+    const key = rec.studentId;
+    const row = byStudent.get(key) ?? {
+      student: name,
+      termId: rec.termId,
+      current: 0,
+      corrected: 0,
+      affected: 0,
+    };
+    row.current += oldPts;
+    row.corrected += newPts;
+    if (Math.abs(delta) > 0.001) row.affected++;
+    byStudent.set(key, row);
+
+    if (Math.abs(delta) > 0.001) {
+      details.push(
+        `${rec.id},"${name}",${rec.termId ?? ''},${mode},${oldPages},${newPages},${oldPts},${newPts},${delta}`,
+      );
+    }
+  }
+
+  const summary = [...byStudent.values()]
+    .map((r) => ({
+      ...r,
+      current: Math.round(r.current * 100) / 100,
+      corrected: Math.round(r.corrected * 100) / 100,
+      delta: Math.round((r.corrected - r.current) * 100) / 100,
+      pct: r.current !== 0
+        ? Math.round(((r.corrected - r.current) / Math.abs(r.current)) * 1000) / 10
+        : 0,
+    }))
+    .sort((a, b) => a.delta - b.delta);
+
+  const bom = '\uFEFF';
+  fs.writeFileSync(
+    'page-audit-summary.csv',
+    bom + 'student,term,points_current,points_corrected,delta,pct,affected_recitations\n' +
+      summary.map((r) =>
+        `"${r.student}",${r.termId ?? ''},${r.current},${r.corrected},${r.delta},${r.pct}%,${r.affected}`,
+      ).join('\n'),
+    'utf8',
+  );
+  fs.writeFileSync('page-audit-details.csv', bom + details.join('\n'), 'utf8');
+
+  const down = summary.filter((r) => r.delta < -0.01);
+  const up = summary.filter((r) => r.delta > 0.01);
+  const worst = summary[0];
+
+  console.log('\n════════ IMPACT SUMMARY ════════');
+  console.log(`students total      : ${summary.length}`);
+  console.log(`points DECREASED    : ${down.length}`);
+  console.log(`points INCREASED    : ${up.length}`);
+  console.log(`unchanged           : ${summary.length - down.length - up.length}`);
+  console.log(`recitations skipped : ${skipped} (insufficient data)`);
+  if (worst) {
+    console.log(`largest drop        : ${worst.student}  ${worst.current} → ${worst.corrected}  (${worst.delta}, ${worst.pct}%)`);
+  }
+  console.log('\nCSV written: page-audit-summary.csv , page-audit-details.csv');
+}
+
+main()
+  .catch((e) => { console.error(e); process.exitCode = 1; })
+  .finally(() => prisma.$disconnect());

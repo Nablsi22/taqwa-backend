@@ -1,0 +1,240 @@
+/**
+ * page-audit.ts (v2) — تقرير أثر توحيد حساب الصفحات.
+ *
+ * READ-ONLY: لا يُنفّذ أي INSERT / UPDATE / DELETE.
+ *
+ * v2 يفصل ثلاثة أشياء كانت مختلطة في v1:
+ *   1. أثر تصحيح الصفحات وحده (نفس القواعد على الطرفين)
+ *   2. انحراف ناتج عن تغيّر القواعد أو تعديل يدوي
+ *   3. التسميعات التي عبرت عتبة الخمس صفحات
+ */
+import { PrismaClient, Prisma } from '@prisma/client';
+import * as fs from 'fs';
+import {
+  calculatePages,
+  getSurahMeta,
+} from '../src/quran-metadata/quran-ayat-pages.util';
+
+const url = process.env.AUDIT_DATABASE_URL;
+if (!url) throw new Error('ABORT: AUDIT_DATABASE_URL is not set.');
+if (!/^postgres(ql)?:\/\//.test(url)) {
+  throw new Error('ABORT: AUDIT_DATABASE_URL is not a connection string.');
+}
+if (/railway\.internal/.test(url)) {
+  throw new Error('ABORT: internal host — use DATABASE_PUBLIC_URL.');
+}
+
+const prisma = new PrismaClient({ datasources: { db: { url } } });
+
+const num = (v: Prisma.Decimal | number | null | undefined): number =>
+  v == null ? 0 : Number(v);
+
+const r3 = (n: number): number => Math.round(n * 1000) / 1000;
+const r2 = (n: number): number => Math.round(n * 100) / 100;
+
+interface Rule {
+  points: number;
+  isActive: boolean;
+  isPerPage: boolean;
+  minPages: number | null;
+}
+type RuleSet = Record<string, Rule>;
+
+/** إعادة تطبيق منطق point-rules.service.ts:128-185 حرفياً. */
+function computePoints(rating: string, pages: number, rules: RuleSet): number {
+  if (!rating || rating === 'REPEAT' || rating === 'DID_NOT_MEMORIZE') return 0;
+  if (pages <= 0) return 0;
+
+  if (rating === 'MAQRAA') {
+    const r = rules['RECITE_MAQRAA'];
+    if (!r || !r.isActive) return 0;
+    return r.isPerPage ? r.points * pages : r.points;
+  }
+
+  if (pages >= 5) {
+    const b = rules['RECITE_5PLUS_PAGES'];
+    if (b && b.isActive && b.minPages && pages >= b.minPages) {
+      return b.points * pages;
+    }
+  }
+
+  const map: Record<string, string> = {
+    GOOD: 'RECITE_GOOD',
+    VERY_GOOD: 'RECITE_VERY_GOOD',
+  };
+  const code = map[rating];
+  if (!code) return 0;
+  const r = rules[code];
+  return r && r.isActive ? r.points * pages : 0;
+}
+
+/** الصفحات الدقيقة لسورة كاملة، بنفس خوارزمية وضع الآيات. */
+function precisePagesForFullSura(n: number): number {
+  const meta = getSurahMeta(n);
+  if (!meta) return 0;
+  return calculatePages(n, 1, n, meta.numAyas);
+}
+
+async function main() {
+  const ruleRows = await prisma.pointRule.findMany({ orderBy: { code: 'asc' } });
+  const rules: RuleSet = {};
+  for (const r of ruleRows) {
+    rules[r.code] = {
+      points: num(r.points),
+      isActive: r.isActive,
+      isPerPage: r.isPerPage,
+      minPages: r.minPages,
+    };
+  }
+
+  console.log('\n=== POINT RULES (recitation-related) ===');
+  for (const r of ruleRows) {
+    if (!r.code.startsWith('RECITE')) continue;
+    console.log(
+      '  ' + r.code.padEnd(22) +
+      ' points=' + String(r.points).padStart(3) +
+      '  perPage=' + String(r.isPerPage).padEnd(5) +
+      '  minPages=' + String(r.minPages ?? '-').padStart(2) +
+      '  active=' + r.isActive,
+    );
+  }
+
+  const recitations = await prisma.recitation.findMany({
+    include: { student: { select: { fullName: true, fatherName: true } } },
+  });
+
+  const logs = await prisma.pointsLog.findMany({
+    where: { sourceId: { in: recitations.map((x) => x.id) } },
+    select: { sourceId: true, amount: true },
+  });
+  const logged = new Map<string, number>();
+  for (const l of logs) {
+    if (!l.sourceId) continue;
+    logged.set(l.sourceId, (logged.get(l.sourceId) ?? 0) + num(l.amount));
+  }
+
+  interface Row {
+    student: string;
+    logged: number;
+    oldCalc: number;
+    newCalc: number;
+    affected: number;
+  }
+  const byStudent = new Map<string, Row>();
+  const details: string[] = [
+    'recitation_id,student,term,mode,rating,pages_old,pages_new,pts_logged,pts_old_calc,pts_new_calc,delta_pages,delta_drift,crossed5',
+  ];
+
+  let skippedNoData = 0;
+  let crossedThreshold = 0;
+  let driftTotal = 0;
+  let noLogRow = 0;
+
+  for (const rec of recitations) {
+    const oldPages = num(rec.pagesRecited);
+    let newPages: number;
+    let mode: string;
+
+    if (rec.isCompleteSura) {
+      const list =
+        rec.surahNumbers && rec.surahNumbers.length
+          ? rec.surahNumbers
+          : [rec.surahNumber];
+      newPages = list.reduce((s, n) => s + precisePagesForFullSura(n), 0);
+      mode = 'full_sura';
+    } else if (rec.startSurah && rec.startAya && rec.endSurah && rec.endAya) {
+      newPages = calculatePages(rec.startSurah, rec.startAya, rec.endSurah, rec.endAya);
+      mode = 'aya_range';
+    } else {
+      newPages = oldPages;
+      mode = 'legacy_nodata';
+      skippedNoData++;
+    }
+    newPages = r3(newPages);
+
+    const hasLog = logged.has(rec.id);
+    if (!hasLog) noLogRow++;
+
+    const ptsLogged = hasLog ? (logged.get(rec.id) as number) : 0;
+    const ptsOldCalc = r3(computePoints(rec.rating, oldPages, rules));
+    const ptsNewCalc = r3(computePoints(rec.rating, newPages, rules));
+
+    // الأثر الصافي للصفحات: نفس القواعد على الطرفين
+    const deltaPages = r3(ptsNewCalc - ptsOldCalc);
+    // الانحراف: الفرق بين ما سُجّل فعلاً وما تحسبه القواعد الحالية
+    const deltaDrift = hasLog ? r3(ptsLogged - ptsOldCalc) : 0;
+    driftTotal += deltaDrift;
+
+    const crossed = oldPages >= 5 !== newPages >= 5;
+    if (crossed) crossedThreshold++;
+
+    const name = (rec.student.fullName + ' ' + (rec.student.fatherName ?? '')).trim();
+    const row = byStudent.get(rec.studentId) ?? {
+      student: name,
+      logged: 0,
+      oldCalc: 0,
+      newCalc: 0,
+      affected: 0,
+    };
+    row.logged += ptsLogged;
+    row.oldCalc += ptsOldCalc;
+    row.newCalc += ptsNewCalc;
+    if (Math.abs(deltaPages) > 0.001) row.affected++;
+    byStudent.set(rec.studentId, row);
+
+    if (Math.abs(deltaPages) > 0.001 || Math.abs(deltaDrift) > 0.001) {
+      details.push([
+        rec.id, '"' + name + '"', rec.termId ?? '', mode, rec.rating,
+        oldPages, newPages, ptsLogged, ptsOldCalc, ptsNewCalc,
+        deltaPages, deltaDrift, crossed ? 'YES' : '',
+      ].join(','));
+    }
+  }
+
+  const summary = Array.from(byStudent.values())
+    .map((r) => ({
+      student: r.student,
+      affected: r.affected,
+      logged: r2(r.logged),
+      oldCalc: r2(r.oldCalc),
+      newCalc: r2(r.newCalc),
+      delta: r2(r.newCalc - r.oldCalc),
+      pct: r.oldCalc !== 0 ? Math.round(((r.newCalc - r.oldCalc) / Math.abs(r.oldCalc)) * 1000) / 10 : 0,
+    }))
+    .sort((a, b) => a.delta - b.delta);
+
+  const bom = '\uFEFF';
+  fs.writeFileSync('page-audit-summary.csv',
+    bom + 'student,pts_logged,pts_old_calc,pts_new_calc,delta_pages,pct,affected\n' +
+    summary.map((r) => ['"' + r.student + '"', r.logged, r.oldCalc, r.newCalc, r.delta, r.pct + '%', r.affected].join(',')).join('\n'),
+    'utf8');
+  fs.writeFileSync('page-audit-details.csv', bom + details.join('\n'), 'utf8');
+
+  const down = summary.filter((r) => r.delta < -0.01);
+  const pcts = down.map((r) => Math.abs(r.pct)).sort((a, b) => a - b);
+  const median = pcts.length ? pcts[Math.floor(pcts.length / 2)] : 0;
+
+  console.log('\n======== IMPACT (pages effect only) ========');
+  console.log('recitations total     : ' + recitations.length);
+  console.log('  legacy w/o range    : ' + skippedNoData);
+  console.log('  without points_log  : ' + noLogRow);
+  console.log('  crossed 5-page line : ' + crossedThreshold);
+  console.log('rules-drift total     : ' + r2(driftTotal) + '  (should be ~0 if rules unchanged)');
+  console.log('');
+  console.log('students total        : ' + summary.length);
+  console.log('  DECREASED           : ' + down.length);
+  console.log('  INCREASED           : ' + summary.filter((r) => r.delta > 0.01).length);
+  console.log('  unchanged           : ' + summary.filter((r) => Math.abs(r.delta) <= 0.01).length);
+  console.log('');
+  console.log('among decreased — drop %:');
+  console.log('  median              : ' + median + '%');
+  console.log('  worst               : ' + (pcts.length ? pcts[pcts.length - 1] : 0) + '%');
+  console.log('  over 20%            : ' + pcts.filter((p) => p > 20).length + ' students');
+  console.log('  over 10%            : ' + pcts.filter((p) => p > 10).length + ' students');
+  console.log('  5% or less          : ' + pcts.filter((p) => p <= 5).length + ' students');
+  console.log('\nCSV written: page-audit-summary.csv , page-audit-details.csv');
+}
+
+main()
+  .catch((e) => { console.error(e); process.exitCode = 1; })
+  .finally(() => prisma.$disconnect());
