@@ -295,6 +295,35 @@ model HalaqaCoverage {
   @@map("halaqa_coverage")
 }
 
+/// The evening notifications already handled — the 9 pm «لم تسجّل»
+/// reminder, the «غاب جلستين متتاليتين» alert and the 11 pm director
+/// summary. One row per (kind, recipient, ref_key) — the row is written
+/// BEFORE the push is sent, so a job that runs twice (a restart at 9 pm, two
+/// replicas) can never send the same notification twice. It doubles as the
+/// log an admin reads to see what went out and whether it was delivered.
+///
+/// ref_key carries the day for daily kinds («2026-10-31:halaqa:<id>»), and
+/// the streak for the absence alert («student:<id>:since:<last attended>»),
+/// which is what makes that alert once per break, not once per evening.
+model ScheduledNotification {
+  id        String   @id @default(uuid())
+  /// ATTENDANCE_REMINDER | ABSENCE_ALERT | DIRECTOR_SUMMARY
+  kind      String
+  userId    String   @map("user_id")
+  /// The day the notification is about (for the log), Damascus calendar.
+  day       DateTime @db.Date
+  refKey    String   @map("ref_key")
+  title     String
+  body      String
+  sent      Boolean  @default(false)
+  error     String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([kind, userId, refKey], map: "scheduled_notifications_kind_user_ref_key")
+  @@index([day])
+  @@map("scheduled_notifications")
+}
+
 model Notification {
   id          String    @id @default(uuid())
   senderId    String    @map("sender_id")

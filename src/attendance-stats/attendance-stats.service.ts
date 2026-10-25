@@ -114,6 +114,8 @@ export interface StudentStats {
   absentStreak: number;
   needsCall: boolean;
   lastAttended: string | null;
+  /** The student's most recent session (attended or not) in the course. */
+  lastSession: string | null;
 }
 
 export type DayStatus = 'PRESENT' | 'LATE' | 'ABSENT' | 'EXCUSED' | 'UNMARKED';
@@ -285,6 +287,7 @@ export class AttendanceStatsService {
         absentStreak: r.absent_streak,
         needsCall: r.absent_streak >= ATTENDANCE_RULES.alertConsecutiveAbsences,
         lastAttended: r.last_attended,
+        lastSession: r.last_session,
       };
     });
   }

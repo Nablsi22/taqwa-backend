@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { APP_GUARD } from '@nestjs/core';
 import { PrismaModule } from './prisma/prisma.module';
 import { InstructorsModule } from './instructors/instructors.module';
@@ -19,6 +20,7 @@ import { TermsModule } from './terms/terms.module';
 import { AttendanceStatsModule } from './attendance-stats/attendance-stats.module';
 import { SubstituteModule } from './substitute/substitute.module';
 import { SupervisorModule } from './supervisor/supervisor.module';
+import { ScheduledNotificationsModule } from './scheduled-notifications/scheduled-notifications.module';
 
 @Module({
   imports: [
@@ -29,6 +31,8 @@ import { SupervisorModule } from './supervisor/supervisor.module';
         limit: 100,
       },
     ]),
+    // The evening notifications' clock (scheduled-notifications.jobs.ts).
+    ScheduleModule.forRoot(),
     PrismaModule,
     AuthModule,
     StudentsModule,
@@ -46,6 +50,7 @@ import { SupervisorModule } from './supervisor/supervisor.module';
     AttendanceStatsModule,
     SubstituteModule,
     SupervisorModule,
+    ScheduledNotificationsModule,
   ],
   providers: [
     {
