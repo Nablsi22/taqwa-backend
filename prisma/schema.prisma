@@ -11,6 +11,11 @@ enum Role {
   ADMIN
   INSTRUCTOR
   STUDENT
+  /// Course director: read-only, own endpoints under /api/v1/supervisor.
+  /// Added by migration 20261024000000_supervisor_role. App versions before
+  /// 1.0.9 read an unknown role as STUDENT, so no account gets this role
+  /// until an app that knows it is on that person's phone.
+  SUPERVISOR
 }
 
 enum AttendanceStatus {
@@ -83,19 +88,26 @@ model Student {
 }
 
 model Instructor {
-  id          String    @id @default(uuid())
-  userId      String    @unique @map("user_id")
-  fullName    String    @map("full_name")
-  dateOfBirth DateTime? @map("date_of_birth")
-  specialty   String?
-  address     String?
-  mobile      String?
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @updatedAt @map("updated_at")
+  id            String    @id @default(uuid())
+  userId        String    @unique @map("user_id")
+  fullName      String    @map("full_name")
+  dateOfBirth   DateTime? @map("date_of_birth")
+  specialty     String?
+  address       String?
+  mobile        String?
+  /// A holding pool for frozen students («عزل»), not a real حلقة: its
+  /// students are left out of every statistic and every reminder.
+  isHoldingPool Boolean   @default(false) @map("is_holding_pool")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
 
   user       User                   @relation(fields: [userId], references: [id])
   students   Student[]
   attendance InstructorAttendance[]
+  /// Days another حلقة was covered by this instructor, and days this
+  /// حلقة was covered by someone else («استلمت هالحلقة اليوم»).
+  covering   HalaqaCoverage[]       @relation("CoveringInstructor")
+  coveredBy  HalaqaCoverage[]       @relation("CoveredHalaqa")
 
   @@index([fullName])
   @@map("instructors")
@@ -106,6 +118,9 @@ model Attendance {
   studentId String           @map("student_id")
   date      DateTime         @db.Date
   status    AttendanceStatus
+  /// «غائب بعذر» — only meaningful with status ABSENT (attendance_excused_only_absent_chk).
+  /// No deduction, no "call the family" alert, not a miss for the regular count.
+  excused   Boolean          @default(false)
   markedBy  String           @map("marked_by")
   notes     String?
   createdAt DateTime         @default(now()) @map("created_at")
@@ -195,6 +210,13 @@ model Gift {
   @@map("gifts")
 }
 
+/// A recitation is ALWAYS a verse range: startSurah + startAya + endAya
+/// inside one surah, enforced by recitations_verse_range_chk for every row
+/// written from 2026-09-05 onwards (rating MAQRAA excepted — see below).
+///
+/// `surahNumbers` / `isCompleteSura` / `pagesRecited` are legacy columns kept
+/// so historical rows stay readable and rendered. Nothing writes the old
+/// whole-sura shape any more.
 model Recitation {
   id              String           @id @default(uuid())
   studentId       String           @map("student_id")
@@ -240,6 +262,37 @@ model InstructorAttendance {
   @@unique([instructorId, date])
   @@index([date])
   @@map("instructor_attendance")
+}
+
+/// «استلمت هالحلقة اليوم» — one instructor taking responsibility for
+/// another حلقة for a single day.
+///
+/// Who actually recorded a mark is already on the record itself
+/// (attendance.markedBy, recitation.instructorId); this table exists so the
+/// 9 pm reminder knows who to ask BEFORE anything is recorded, and so the
+/// 11 pm summary can name the substitute of a حلقة whose teacher was away.
+/// It never moves a student: every student stays in his own حلقة.
+///
+/// Several substitutes may share one حلقة on one day, so the key is
+/// (halaqa, substitute, date).
+model HalaqaCoverage {
+  id                   String   @id @default(uuid())
+  /// The حلقة being covered — the instructor the students belong to.
+  halaqaInstructorId   String   @map("halaqa_instructor_id")
+  /// The substitute who took it for the day.
+  coveringInstructorId String   @map("covering_instructor_id")
+  date                 DateTime @db.Date
+  note                 String?
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  halaqaInstructor   Instructor @relation("CoveredHalaqa", fields: [halaqaInstructorId], references: [id], onDelete: Cascade)
+  coveringInstructor Instructor @relation("CoveringInstructor", fields: [coveringInstructorId], references: [id], onDelete: Cascade)
+
+  @@unique([halaqaInstructorId, coveringInstructorId, date], map: "halaqa_coverage_halaqa_covering_date_key")
+  @@index([date])
+  @@index([coveringInstructorId])
+  @@index([halaqaInstructorId, date])
+  @@map("halaqa_coverage")
 }
 
 model Notification {
@@ -309,20 +362,46 @@ model Announcement {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TERM (Season) — separates Winter/Summer chapters so points display can
-// be filtered per-term while preserving full historical data.
+// TERM ("دورة" / course) — the unit of points isolation.
+//
+// Every course is completely independent: its own points, its own
+// leaderboard, its own statistics. Starting a course copies, resets and
+// deletes NOTHING — students and all previous courses stay exactly as they
+// are; the new course simply has no points_log rows yet, so every balance in
+// it reads 0. Points never move between courses.
+//
 // Added 2026-06-08. Backfill performed by prisma/seed-terms.ts.
-// Auto-tagging of new rows is handled by DB triggers (see migration SQL).
+//
+// Guarantees that live in the database and cannot be expressed in this file
+// (see prisma/migrations/*/migration.sql):
+//   • terms_only_one_active_idx        — at most one active course
+//   • set_term_id_to_active            — stamps new rows with the active
+//                                        course (belt to the application
+//                                        layer's braces)
+//   • freeze_term_id                   — a row's course is immutable, so
+//                                        points can never migrate
+//   • *_term_required_chk              — every row written from 2026-09-05
+//                                        onwards must carry a course
+//   • recitations_verse_range_chk      — every new non-MAQRAA recitation
+//                                        must carry a valid single-surah
+//                                        verse range
 // ═══════════════════════════════════════════════════════════════════════════
 model Term {
-  id        Int       @id @default(autoincrement())
-  name      String    @unique
-  nameAr    String    @map("name_ar")
-  startDate DateTime  @map("start_date") @db.Date
-  endDate   DateTime? @map("end_date") @db.Date
-  isActive  Boolean   @default(false) @map("is_active")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  id           Int       @id @default(autoincrement())
+  name         String    @unique
+  nameAr       String    @map("name_ar")
+  startDate    DateTime  @map("start_date") @db.Date
+  endDate      DateTime? @map("end_date") @db.Date
+  isActive     Boolean   @default(false) @map("is_active")
+  /// Meeting days as ISO weekdays (Monday = 1 … Sunday = 7, as PostgreSQL
+  /// EXTRACT(ISODOW)). Only a REQUIRED day can be missed; an OPTIONAL day —
+  /// and any day outside the schedule — counts for a student only if they
+  /// attended, and an absence on it is never deducted. Disjoint, enforced by
+  /// terms_meeting_days_chk.
+  requiredDays Int[]     @default([]) @map("required_days")
+  optionalDays Int[]     @default([]) @map("optional_days")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
 
   recitations Recitation[]
   pointsLog   PointsLog[]
@@ -330,6 +409,7 @@ model Term {
   @@index([isActive])
   @@map("terms")
 }
+
 // ═══════════════════════════════════════════════════════════════════════════
 // NAWAWI 40 HADITH — added 2026-06-23 (additive; DB tables already applied on
 // production via direct migration, no SQL file in repo). Scalar-only models:

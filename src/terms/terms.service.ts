@@ -7,6 +7,19 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateTermDto } from './dto/create-term.dto';
 import { UpdateTermDto } from './dto/update-term.dto';
 
+/**
+ * Validated meeting days, sorted. A weekday cannot be both required and
+ * optional (also enforced in the database by terms_meeting_days_chk).
+ */
+export function normalizeMeetingDays(required: number[], optional: number[]): { requiredDays: number[]; optionalDays: number[] } {
+  const requiredDays = [...new Set(required)].sort((a, b) => a - b);
+  const optionalDays = [...new Set(optional)].sort((a, b) => a - b);
+  if (requiredDays.some((d) => optionalDays.includes(d))) {
+    throw new BadRequestException('لا يمكن أن يكون اليوم نفسه إلزامياً واختيارياً معاً');
+  }
+  return { requiredDays, optionalDays };
+}
+
 @Injectable()
 export class TermsService {
   /**
@@ -38,15 +51,83 @@ export class TermsService {
     return this.cache.termId;
   }
 
+  /**
+   * Active-course id, or a 400 when there is none.
+   *
+   * Every write that produces points (recitation, hadith, manual award,
+   * attendance) goes through here first, so a points row can never be
+   * created outside a course. The DB backs this up with
+   * `points_log_term_required_chk` / `recitations_term_required_chk`; this
+   * exists so the instructor sees an actionable Arabic message instead of a
+   * raw constraint violation.
+   */
+  async requireActiveTermId(): Promise<number> {
+    const id = await this.getActiveTermId();
+    if (id == null) {
+      throw new BadRequestException(
+        'لا توجد دورة مفعّلة حالياً. يرجى تفعيل دورة من شاشة إدارة الدورات قبل تسجيل أي نقاط أو تسميع.',
+      );
+    }
+    return id;
+  }
+
   invalidateCache(): void {
     this.cache = null;
   }
 
+  /**
+   * Every course, active first then newest. Each row carries the counters the
+   * management screen shows, so listing courses is one round-trip instead of
+   * one `GET /terms/:id/stats` per row.
+   */
   async findAll() {
     const terms = await this.prisma.term.findMany({
       orderBy: [{ isActive: 'desc' }, { startDate: 'desc' }],
     });
-    return { data: terms };
+    if (terms.length === 0) return { data: [] };
+
+    const ids = terms.map((t) => t.id);
+    const [pointsByTerm, recitationsByTerm, studentsByTerm] = await Promise.all([
+      this.prisma.pointsLog.groupBy({
+        by: ['termId'],
+        where: { termId: { in: ids } },
+        _sum: { amount: true },
+      }),
+      this.prisma.recitation.groupBy({
+        by: ['termId'],
+        where: { termId: { in: ids } },
+        _count: { _all: true },
+      }),
+      this.prisma.pointsLog.findMany({
+        where: { termId: { in: ids } },
+        select: { termId: true, studentId: true },
+        distinct: ['termId', 'studentId'],
+      }),
+    ]);
+
+    const points = new Map<number, number>();
+    for (const row of pointsByTerm) {
+      if (row.termId != null) points.set(row.termId, Number(row._sum.amount ?? 0));
+    }
+    const recitations = new Map<number, number>();
+    for (const row of recitationsByTerm) {
+      if (row.termId != null) recitations.set(row.termId, row._count._all);
+    }
+    const students = new Map<number, number>();
+    for (const row of studentsByTerm) {
+      if (row.termId != null) {
+        students.set(row.termId, (students.get(row.termId) ?? 0) + 1);
+      }
+    }
+
+    return {
+      data: terms.map((t) => ({
+        ...t,
+        totalPoints: points.get(t.id) ?? 0,
+        recitationCount: recitations.get(t.id) ?? 0,
+        activeStudentCount: students.get(t.id) ?? 0,
+      })),
+    };
   }
 
   async findActive() {
@@ -82,6 +163,10 @@ export class TermsService {
       throw new BadRequestException(`الاسم "${dto.name}" مستخدم سابقاً`);
     }
 
+    // Starting a course NEVER copies, resets or deletes anything: students,
+    // their history and every previous course's points stay exactly where
+    // they are. A new course simply has no points_log rows yet, so every
+    // student's balance in it reads 0. That is the whole mechanism.
     const term = await this.prisma.$transaction(async (tx) => {
       if (dto.isActive === true) {
         await tx.term.updateMany({
@@ -96,6 +181,7 @@ export class TermsService {
           startDate,
           endDate,
           isActive:  dto.isActive ?? false,
+          ...normalizeMeetingDays(dto.requiredDays ?? [], dto.optionalDays ?? []),
         },
       });
     });
@@ -105,9 +191,15 @@ export class TermsService {
   }
 
   async update(id: number, dto: UpdateTermDto) {
-    await this.findOne(id); // 404 if missing
+    const { data: current } = await this.findOne(id); // 404 if missing
 
     const data: Record<string, unknown> = {};
+    if (dto.requiredDays !== undefined || dto.optionalDays !== undefined) {
+      Object.assign(
+        data,
+        normalizeMeetingDays(dto.requiredDays ?? current.requiredDays, dto.optionalDays ?? current.optionalDays),
+      );
+    }
     if (dto.nameAr    !== undefined) data.nameAr    = dto.nameAr;
     if (dto.startDate !== undefined) data.startDate = new Date(dto.startDate);
     if (dto.endDate   !== undefined) {

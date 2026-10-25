@@ -76,6 +76,7 @@ prisma/backup-restore.ts
 
 # Local timestamped backups
 *.bak
+*.bak[0-9]
 audit-page-calculation.js
 page-audit.csv
 
@@ -83,3 +84,5 @@ _backups/
 
 exports/
 *.csv
+
+*.bak-*

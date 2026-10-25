@@ -5,9 +5,11 @@ import {
   Delete,
   Body,
   Param,
+  Query,
   Req,
   UseGuards,
   ParseUUIDPipe,
+  BadRequestException,
 } from '@nestjs/common';
 import { RecitationService } from './recitation.service';
 import {
@@ -19,6 +21,24 @@ import { CreateHadithRecitationDto } from './dto/create-hadith-recitation.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+
+/**
+ * `termId` query parameter, shared by the course-scoped reads below.
+ *
+ *   absent → undefined → the ACTIVE course
+ *   0      → every course (admin browsing full history)
+ *   > 0    → that specific course
+ *
+ * `undefined` and `0` mean different things, so no truthiness check here.
+ */
+function parseTermId(raw?: string): number | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestException('قيمة غير صالحة للمعامل termId');
+  }
+  return n;
+}
 
 @Controller('api/v1/recitations')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -75,7 +95,7 @@ export class RecitationController {
   // GET /recitations/hadith/rules — all 42 Nawawi rules (rules-read roles)
   // Static route — declared before the `:id` matcher below.
   @Get('hadith/rules')
-  @Roles('ADMIN', 'INSTRUCTOR')
+  @Roles('ADMIN', 'INSTRUCTOR', 'SUPERVISOR')
   getHadithRules() {
     return this.recitationService.getHadithRules();
   }
@@ -83,9 +103,11 @@ export class RecitationController {
   // GET /recitations/overview
   @Get('overview')
   @Roles('INSTRUCTOR', 'ADMIN')
-  async getOverview(@Req() req: any) {
+  async getOverview(@Req() req: any, @Query('termId') termId?: string) {
     const instructorId = req.user.id;
-    return this.recitationService.getInstructorOverview(instructorId);
+    return this.recitationService.getInstructorOverview(instructorId, {
+      termId: parseTermId(termId),
+    });
   }
 
   // Static student route — before any student/:id/... matchers below
@@ -98,25 +120,30 @@ export class RecitationController {
   // GET /recitations/student/:id/hadith-progress
   // Nawawi-40 memorization map — cumulative across terms (see service).
   @Get('student/:id/hadith-progress')
-  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
+  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
   async getStudentHadithProgress(@Param('id') studentId: string) {
     return this.recitationService.getStudentHadithProgress(studentId);
   }
 
   @Get('student/:id/progress')
-  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
+  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
   async getStudentProgress(@Param('id') studentId: string) {
     return this.recitationService.getStudentProgress(studentId);
   }
 
   @Get('student/:id/history')
-  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
-  async getStudentRecitations(@Param('id') studentId: string) {
-    return this.recitationService.getStudentRecitations(studentId);
+  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
+  async getStudentRecitations(
+    @Param('id') studentId: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.recitationService.getStudentRecitations(studentId, {
+      termId: parseTermId(termId),
+    });
   }
 
   @Get('student/:id/homework')
-  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
+  @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
   async getStudentHomework(@Param('id') studentId: string) {
     return this.recitationService.getStudentHomework(studentId);
   }

@@ -40,16 +40,20 @@ export class PointsService {
   //   • explicit === 0         → no filter (admin viewing full history)
   //   • explicit > 0           → that specific term id
   // ═══════════════════════════════════════════════════════════════════════
+  private async resolveTermId(
+    explicit?: number | null,
+  ): Promise<number | null> {
+    if (explicit === 0) return null; // explicit "all courses"
+    if (typeof explicit === 'number' && explicit > 0) return explicit;
+    return this.termsService.getActiveTermId();
+  }
+
   private async resolveTermWhere(
     explicit?: number | null,
   ): Promise<Prisma.PointsLogWhereInput> {
-    if (explicit === 0) return {};
-    if (typeof explicit === 'number' && explicit > 0) {
-      return { termId: explicit };
-    }
-    const active = await this.termsService.getActiveTermId();
-    if (active == null) return {}; // no active term: safety fallback
-    return { termId: active };
+    const termId = await this.resolveTermId(explicit);
+    if (termId == null) return {}; // all courses, or no active course
+    return { termId };
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -85,6 +89,12 @@ export class PointsService {
     if (category.hasRating && dto.rating === 'REPEAT') amount = 0;
     if (category.type === 'DEDUCT' && amount > 0) amount = -amount;
 
+    // Stamped in the application layer rather than relying on the
+    // set_term_id_to_active DB trigger alone: the course a point belongs to
+    // is part of what this endpoint means, and a missing active course must
+    // fail with an actionable message, not a constraint violation.
+    const termId = await this.termsService.requireActiveTermId();
+
     const log = await this.prisma.pointsLog.create({
       data: {
         studentId: dto.studentId,
@@ -94,6 +104,7 @@ export class PointsService {
         description: dto.description || category.nameAr || category.name,
         awardedBy: awardedByUserId,
         sourceType: 'MANUAL',
+        termId,
       },
       include: {
         student: { select: { fullName: true } },
@@ -198,6 +209,8 @@ export class PointsService {
       );
     }
 
+    const termId = await this.termsService.requireActiveTermId();
+
     const log = await this.prisma.pointsLog.create({
       data: {
         studentId: input.studentId,
@@ -206,6 +219,7 @@ export class PointsService {
         description: finalDescription,
         awardedBy: awardedByUserId,
         sourceType: 'MANUAL',
+        termId,
       },
       include: { student: { select: { fullName: true } } },
     });
@@ -248,6 +262,7 @@ export class PointsService {
       throw new NotFoundException('الطالب غير موجود');
     }
 
+    const resolvedTermId = await this.resolveTermId(termId);
     const termWhere = await this.resolveTermWhere(termId);
     const baseWhere: Prisma.PointsLogWhereInput = { studentId, ...termWhere };
 
@@ -275,6 +290,10 @@ export class PointsService {
         id: student.id,
         fullName: student.fullName,
       },
+      // Which course these figures belong to. Echoed back so a screen can
+      // label the total it is showing and never present one course's points
+      // under another course's heading.
+      termId: resolvedTermId,
       totalPoints: totalPointsNumber,
       data: logs.map((log) => {
         const sourceTypeKey = this.normalizeSourceType(log.sourceType);
@@ -391,6 +410,7 @@ export class PointsService {
     const { totals, ranks, total } = await this.getMosqueRanking(termId);
     return {
       studentId,
+      termId: await this.resolveTermId(termId),
       rank: ranks.get(studentId) ?? null,
       total,
       totalPoints: totals.get(studentId) ?? 0,
@@ -407,6 +427,7 @@ export class PointsService {
     const studentWhere: Prisma.StudentWhereInput = { deletedAt: null };
     if (instructorId) studentWhere.instructorId = instructorId;
 
+    const resolvedTermId = await this.resolveTermId(termId);
     const termWhere = await this.resolveTermWhere(termId);
 
     const students = await this.prisma.student.findMany({
@@ -438,7 +459,9 @@ export class PointsService {
       .slice(0, limit)
       .map((s, index) => ({ ...s, rank: index + 1 }));
 
-    return { data: ranked };
+    // `termId` is additive — older clients ignore it, newer ones use it to
+    // caption the board with the course it actually reflects.
+    return { data: ranked, termId: resolvedTermId };
   }
 
   // ─────────────────────────────────────────────────────────────────────

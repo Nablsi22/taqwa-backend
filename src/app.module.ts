@@ -16,6 +16,9 @@ import { RecitationModule } from './recitation/recitation.module';
 import { NotificationModule } from './notification/notification.module';
 import { InstructorAttendanceModule } from './instructor-attendance/instructor-attendance.module';
 import { TermsModule } from './terms/terms.module';
+import { AttendanceStatsModule } from './attendance-stats/attendance-stats.module';
+import { SubstituteModule } from './substitute/substitute.module';
+import { SupervisorModule } from './supervisor/supervisor.module';
 
 @Module({
   imports: [
@@ -40,6 +43,9 @@ import { TermsModule } from './terms/terms.module';
     NotificationModule,
     InstructorAttendanceModule,
     TermsModule,
+    AttendanceStatsModule,
+    SubstituteModule,
+    SupervisorModule,
   ],
   providers: [
     {

@@ -216,7 +216,8 @@ export class StudentsController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   @Get(':id')
-  @Roles('ADMIN', 'INSTRUCTOR')
+  // SUPERVISOR: the course director reads a student's page (read-only).
+  @Roles('ADMIN', 'INSTRUCTOR', 'SUPERVISOR')
   findOne(
     @Param('id', ParseUUIDPipe) id: string,
     @Query('termId') termId?: string,

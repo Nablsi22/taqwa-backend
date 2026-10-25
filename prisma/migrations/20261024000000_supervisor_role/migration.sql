@@ -1,0 +1,33 @@
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Migration: supervisor_role
+-- Date:      2026-10-24
+--
+-- Purpose
+--   Adds the course-director role. `SUPERVISOR` is read-only: it has its own
+--   endpoints under /api/v1/supervisor, and every other route either names
+--   the roles it allows (so SUPERVISOR is refused) or is self-scoped to the
+--   caller's own account.
+--
+-- Why this migration contains ONE statement and nothing else
+--   PostgreSQL will not let a transaction use an enum value that the same
+--   transaction added, and Prisma runs each migration inside one transaction.
+--   So the value is added here, alone, and the first code that stores it ships
+--   in a later deploy. Adding a value also needs PostgreSQL 12 or newer, which
+--   is what Railway's Postgres runs.
+--     https://www.postgresql.org/docs/current/sql-altertype.html
+--
+-- Safety contract (runs against live production data)
+--   • Adds one label to an enum type. No table, column, row or constraint is
+--     read, altered or deleted, and no user's role changes: giving the
+--     director's account this role is a separate, deliberate act.
+--   • Idempotent through IF NOT EXISTS, so a re-run changes nothing.
+--   • Existing ADMIN / INSTRUCTOR / STUDENT values and their order are
+--     untouched, so nothing that reads a role behaves differently.
+--
+-- Note for the app
+--   Versions of the app before 1.0.9 parse an unknown role as STUDENT
+--   (UserRole.fromString falls back to student). So no account may be given
+--   this role until an app that knows SUPERVISOR is on that person's phone.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+ALTER TYPE "Role" ADD VALUE IF NOT EXISTS 'SUPERVISOR';

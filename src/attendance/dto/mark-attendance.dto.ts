@@ -3,6 +3,7 @@ import {
   IsEnum,
   IsOptional,
   IsArray,
+  IsBoolean,
   ValidateNested,
   IsUUID,
   IsDateString,
@@ -21,6 +22,15 @@ class StudentAttendanceEntry {
 
   @IsEnum(AttendanceStatus)
   status: AttendanceStatus;
+
+  /**
+   * «غائب بعذر». Only valid with status ABSENT. Omitted → an existing excuse
+   * on the same record is kept (app versions that predate this field must
+   * not silently erase an excuse when they re-save the sheet).
+   */
+  @IsOptional()
+  @IsBoolean()
+  excused?: boolean;
 
   @IsOptional()
   @IsString()

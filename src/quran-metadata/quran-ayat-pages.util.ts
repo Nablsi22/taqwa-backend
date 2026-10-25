@@ -128,7 +128,30 @@ export function getAllSurahs(): SurahMeta[] {
 }
 
 /**
+ * Number of ayat in a range — THE definition of verse count for this system.
+ *
+ *     verseCount = endAya - startAya + 1
+ *
+ * Every write, read, points calculation and report goes through this one
+ * function, so no two screens can ever disagree about how long a recitation
+ * was. There is deliberately no rounding and no estimation anywhere in it.
+ *
+ * Returns 0 for any range validateRange() would reject, so a caller that
+ * skipped validation still cannot produce a negative or inflated count.
+ */
+export function getVerseCount(startAya: number, endAya: number): number {
+  if (!Number.isInteger(startAya) || !Number.isInteger(endAya)) return 0;
+  if (startAya < 1 || endAya < startAya) return 0;
+  return endAya - startAya + 1;
+}
+
+/**
  * Validate an aya range. Single-surah only.
+ *
+ * This is the authoritative gate for the three rules the recitation form
+ * promises: start >= 1, end <= the surah's real ayah count, start <= end.
+ * The database backs it up with `recitations_verse_range_chk`; the ayah-count
+ * ceiling needs the Quran metadata and so lives only here.
  */
 export function validateRange(
   startSurah: number,
@@ -141,11 +164,29 @@ export function validateRange(
   }
   const meta = getSurahMeta(startSurah);
   if (!meta) return { valid: false, error: `سورة غير صالحة: ${startSurah}` };
-  if (startAya < 1 || startAya > meta.numAyas) {
-    return { valid: false, error: 'آية البداية غير صالحة' };
+  if (!Number.isInteger(startAya) || !Number.isInteger(endAya)) {
+    return { valid: false, error: 'أرقام الآيات يجب أن تكون أعداداً صحيحة' };
   }
-  if (endAya < startAya || endAya > meta.numAyas) {
-    return { valid: false, error: 'آية النهاية غير صالحة' };
+  if (startAya < 1) {
+    return { valid: false, error: 'آية البداية يجب أن تكون 1 أو أكثر' };
+  }
+  if (startAya > meta.numAyas) {
+    return {
+      valid: false,
+      error: `آية البداية خارج نطاق سورة ${meta.nameAr} (عدد آياتها ${meta.numAyas})`,
+    };
+  }
+  if (endAya > meta.numAyas) {
+    return {
+      valid: false,
+      error: `آية النهاية خارج نطاق سورة ${meta.nameAr} (عدد آياتها ${meta.numAyas})`,
+    };
+  }
+  if (endAya < startAya) {
+    return {
+      valid: false,
+      error: 'آية النهاية يجب أن تكون مساوية أو أكبر من آية البداية',
+    };
   }
   return { valid: true };
 }

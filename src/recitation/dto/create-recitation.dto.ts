@@ -22,18 +22,40 @@ export enum RecitationRatingDto {
   MAQRAA = 'MAQRAA',
 }
 
+/**
+ * FULL_SURA is retired but still listed here on purpose.
+ *
+ * Roughly a hundred instructors are running installed APKs that may still
+ * send it. Keeping the value means those requests fail validation-free and
+ * reach the service, which answers with FULL_SURA_RETIRED_MESSAGE — a
+ * sentence telling the instructor to update the app. Dropping the value
+ * would instead return a generic "type must be one of the following values"
+ * error that nobody in the mosque can act on.
+ */
 export enum BatchSegmentType {
   FULL_SURA = 'FULL_SURA',
   AYA_RANGE = 'AYA_RANGE',
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LEGACY single-segment DTO (still used by POST /recitations)
+// SINGLE-SEGMENT DTO (POST /recitations)
+//
+// A recitation is a verse range: startSurah + startAya + endAya. The three
+// range rules the form promises are checked in three places, deliberately:
+//   • here          — shape and integer bounds (start >= 1, surah 1..114)
+//   • validateRange — the ayah-count ceiling, which needs Quran metadata
+//   • the database  — recitations_verse_range_chk, so nothing gets in
+//                     through another client or a manual query
+//
+// `surahNumbers` / `pagesRecited` survive only so an older client's request
+// still parses and can be answered with FULL_SURA_RETIRED_MESSAGE instead of
+// a validation dump. Nothing reads them any more.
 // ═══════════════════════════════════════════════════════════════════
 export class CreateRecitationDto {
   @IsString()
   studentId: string;
 
+  /** @deprecated retired shape — accepted only to be refused politely. */
   @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
@@ -42,6 +64,7 @@ export class CreateRecitationDto {
   @Max(114, { each: true })
   surahNumbers?: number[];
 
+  /** @deprecated pages are computed from the verse range, never supplied. */
   @IsOptional()
   @IsNumber()
   @Min(0)
@@ -51,14 +74,16 @@ export class CreateRecitationDto {
   startSurah?: number;
 
   @ValidateIf((o) => o.startSurah !== undefined)
-  @IsInt() @Min(1)
+  @IsInt({ message: 'آية البداية يجب أن تكون رقماً صحيحاً' })
+  @Min(1, { message: 'آية البداية يجب أن تكون 1 أو أكثر' })
   startAya?: number;
 
   @IsOptional() @IsInt() @Min(1) @Max(114)
   endSurah?: number;
 
   @ValidateIf((o) => o.startAya !== undefined)
-  @IsInt() @Min(1)
+  @IsInt({ message: 'آية النهاية يجب أن تكون رقماً صحيحاً' })
+  @Min(1, { message: 'آية النهاية يجب أن تكون 1 أو أكثر' })
   endAya?: number;
 
   @IsEnum(RecitationRatingDto)
@@ -76,12 +101,11 @@ export class CreateRecitationDto {
 // PER-SEGMENT DTO (NEW) — each segment carries its own rating
 // ═══════════════════════════════════════════════════════════════════
 //
-// Discriminated by `type`:
-//   { type: 'FULL_SURA', surahNumbers: [89, 90], rating: 'VERY_GOOD' }
+// The one accepted shape:
 //   { type: 'AYA_RANGE', startSurah: 89, startAya: 1, endAya: 15, rating: 'GOOD' }
 //
-// Shape (which fields are required for which `type`) is validated in
-// the service so we can return position-aware Arabic messages — same
+// Per-segment completeness and the ayah-count ceiling are validated in the
+// service so the error can name the segment position in Arabic — the same
 // pattern used elsewhere in this controller.
 //
 export class BatchSegmentDto {
@@ -91,7 +115,7 @@ export class BatchSegmentDto {
   @IsEnum(RecitationRatingDto)
   rating: RecitationRatingDto;
 
-  // FULL_SURA fields
+  /** @deprecated retired shape — accepted only to be refused politely. */
   @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
@@ -100,14 +124,18 @@ export class BatchSegmentDto {
   @Max(114, { each: true })
   surahNumbers?: number[];
 
-  // AYA_RANGE fields
+  // ── Verse range ──
   @IsOptional() @IsInt() @Min(1) @Max(114)
   startSurah?: number;
 
-  @IsOptional() @IsInt() @Min(1)
+  @IsOptional()
+  @IsInt({ message: 'آية البداية يجب أن تكون رقماً صحيحاً' })
+  @Min(1, { message: 'آية البداية يجب أن تكون 1 أو أكثر' })
   startAya?: number;
 
-  @IsOptional() @IsInt() @Min(1)
+  @IsOptional()
+  @IsInt({ message: 'آية النهاية يجب أن تكون رقماً صحيحاً' })
+  @Min(1, { message: 'آية النهاية يجب أن تكون 1 أو أكثر' })
   endAya?: number;
 }
 

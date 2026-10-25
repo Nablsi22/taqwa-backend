@@ -27,7 +27,32 @@ import {
   calculatePoints,
   validateRange,
   getSurahMeta,
+  getVerseCount,
 } from '../quran-metadata/quran-ayat-pages.util';
+import { TermsService } from '../terms/terms.service';
+
+// ╔═══════════════════════════════════════════════════════════════════╗
+// WHY THERE IS NO "WHOLE SURA" OPTION ANY MORE
+//
+// Until 2026-09 an instructor could record "سورة كاملة" and the page count
+// came from a per-surah table, while an aya range was measured against the
+// mushaf page map. The two disagreed badly — a production audit put whole-
+// sura entries 40-75% above the exact figure for the same content, so two
+// students who memorised the same ayat could receive very different points
+// depending on which button their instructor pressed.
+//
+// Every recitation is now a verse range: surah + startAya + endAya. One
+// measurement, one formula, identical for every student. Old clients that
+// still send the whole-sura shape get FULL_SURA_RETIRED_MESSAGE, which tells
+// the instructor to update the app rather than silently recording something
+// unfair.
+//
+// Historical rows are untouched: they keep their original shape and their
+// original points, and every read path below still renders them.
+// ╚═══════════════════════════════════════════════════════════════════╝
+const FULL_SURA_RETIRED_MESSAGE =
+  'لم يعد تسجيل «سورة كاملة» متاحاً. يرجى تحديد السورة ثم «من آية» و«إلى آية». ' +
+  'إذا لم تظهر لك هذه الخيارات فيرجى تحديث التطبيق إلى آخر إصدار.';
 
 // ╔═══════════════════════════════════════════════════════════════════╗
 // LAST-RECITATION DTO TYPES (Deliverable 2)
@@ -73,7 +98,22 @@ export class RecitationService {
     private prisma: PrismaService,
     private pointRulesService: PointRulesService,
     private pointsService: PointsService,
+    private termsService: TermsService,
   ) {}
+
+  // ═══════════════════════════════════════════════════════════════════
+  // COURSE FILTER RESOLVER — identical semantics to PointsService:
+  //   undefined → the active course (what an unmodified client gets)
+  //   0         → every course (admin browsing full history)
+  //   > 0       → that specific course
+  // ═══════════════════════════════════════════════════════════════════
+  private async resolveTermId(
+    explicit?: number | null,
+  ): Promise<number | null> {
+    if (explicit === 0) return null;
+    if (typeof explicit === 'number' && explicit > 0) return explicit;
+    return this.termsService.getActiveTermId();
+  }
 
   // ─────────────────────────────────────────────────────────────────
   // Helpers (unchanged)
@@ -305,7 +345,11 @@ export class RecitationService {
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // CREATE — legacy single-recitation (UNCHANGED)
+  // CREATE — single recitation. VERSE RANGE ONLY.
+  //
+  // Exactly one accepted shape: startSurah + startAya + endAya, inside one
+  // surah. The legacy whole-sura / multi-sura shape is refused with
+  // FULL_SURA_RETIRED_MESSAGE (see the note at the top of this file).
   // ─────────────────────────────────────────────────────────────────
 
   async create(dto: CreateRecitationDto, instructorId: string) {
@@ -316,121 +360,78 @@ export class RecitationService {
     });
     if (!student) throw new NotFoundException('الطالب غير موجود');
 
+    // A recitation always belongs to exactly one course. Resolved here rather
+    // than left to the set_term_id_to_active trigger so "no active course"
+    // surfaces as an actionable Arabic message instead of a constraint error.
+    const termId = await this.termsService.requireActiveTermId();
+
+    if (dto.startSurah === undefined || dto.startAya === undefined) {
+      throw new BadRequestException(FULL_SURA_RETIRED_MESSAGE);
+    }
+
+    const startSurah = dto.startSurah;
+    const endSurah = dto.endSurah ?? startSurah;
+    const startAya = dto.startAya;
+    const endAya = dto.endAya ?? startAya;
+
+    const v = validateRange(startSurah, startAya, endSurah, endAya);
+    if (!v.valid) throw new BadRequestException(v.error);
+
+    const verseCount = getVerseCount(startAya, endAya);
+    const pages = calculatePages(startSurah, startAya, endSurah, endAya);
+    const pagesDec = new Prisma.Decimal(pages.toFixed(3));
+    const surahMeta = getSurahMeta(startSurah)!;
     const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
-
-    const isNewFormat =
-      dto.startSurah !== undefined && dto.startAya !== undefined;
-
-    if (isNewFormat) {
-      const startSurah = dto.startSurah!;
-      const endSurah = dto.endSurah ?? startSurah;
-      const startAya = dto.startAya!;
-      const endAya = dto.endAya ?? startAya;
-
-      if (endSurah !== startSurah) {
-        throw new BadRequestException('يُسمح فقط بنطاق ضمن سورة واحدة');
-      }
-      const v = validateRange(startSurah, startAya, endSurah, endAya);
-      if (!v.valid) throw new BadRequestException(v.error);
-
-      const pages = calculatePages(startSurah, startAya, endSurah, endAya);
-      const pagesDec = new Prisma.Decimal(pages.toFixed(3));
-      const surahMeta = getSurahMeta(startSurah)!;
-
-      const recitation = await this.prisma.recitation.create({
-        data: {
-          studentId: dto.studentId,
-          instructorId,
-          surahNumber: startSurah,
-          surahNumbers: [startSurah],
-          pagesRecited: Math.max(1, Math.round(pages)),
-          isCompleteSura:
-            startAya === 1 && endAya >= surahMeta.numAyas,
-          rating: dto.rating,
-          homework: dto.homework || null,
-          date: new Date(dto.date),
-          startSurah,
-          startAya,
-          endSurah,
-          endAya,
-          pagesCalculated: pagesDec,
-        },
-      });
-
-      await this.applyNewFormatPoints(
-        dto.studentId,
-        instructorId,
-        dto.rating,
-        pages,
-        recitation.id,
-        pointsCreatedAt,
-      );
-
-      return {
-        data: { ...recitation, suraNames: [surahMeta.nameAr] },
-        suraName: surahMeta.nameAr,
-        message: 'تم تسجيل التسميع بنجاح',
-      };
-    }
-
-    if (!dto.surahNumbers || dto.surahNumbers.length === 0) {
-      throw new BadRequestException('surahNumbers مطلوب');
-    }
-    for (const n of dto.surahNumbers) {
-      if (!getSuraByNumber(n)) {
-        throw new BadRequestException(`رقم السورة غير صالح: ${n}`);
-      }
-    }
-
-    const isMulti = dto.surahNumbers.length > 1;
-    let pagesRecited: number;
-
-    if (isMulti) {
-      pagesRecited = dto.surahNumbers.reduce((sum, n) => {
-        const s = getSuraByNumber(n);
-        return sum + (s?.totalPages ?? 0);
-      }, 0);
-      pagesRecited = Math.round(pagesRecited * 100) / 100;
-    } else {
-      pagesRecited = dto.pagesRecited ?? 0;
-    }
-
-    const primarySurah = dto.surahNumbers[0];
 
     const recitation = await this.prisma.recitation.create({
       data: {
         studentId: dto.studentId,
         instructorId,
-        surahNumber: primarySurah,
-        surahNumbers: dto.surahNumbers,
-        pagesRecited,
-        isCompleteSura: isMulti,
+        surahNumber: startSurah,
+        surahNumbers: [startSurah],
+        // Legacy display column, kept in step with the range for any older
+        // screen still reading it. `pagesCalculated` holds the exact figure
+        // and is the only one the points formula ever sees.
+        pagesRecited: Math.max(1, Math.round(pages)),
+        isCompleteSura: startAya === 1 && endAya >= surahMeta.numAyas,
         rating: dto.rating,
         homework: dto.homework || null,
         date: new Date(dto.date),
+        termId,
+        startSurah,
+        startAya,
+        endSurah: startSurah,
+        endAya,
+        pagesCalculated: pagesDec,
       },
     });
 
-    await this.applyRecitationPoints(
+    await this.applyRangePoints(
       dto.studentId,
       instructorId,
       dto.rating,
-      pagesRecited,
+      pages,
       recitation.id,
       pointsCreatedAt,
+      termId,
     );
 
-    const suraNames = dto.surahNumbers.map((n) => getSuraName(n));
-
     return {
-      data: { ...recitation, suraNames },
-      suraName: suraNames.join('، '),
+      data: { ...recitation, suraNames: [surahMeta.nameAr], verseCount },
+      suraName: surahMeta.nameAr,
+      verseCount,
+      pages: Math.round(pages * 1000) / 1000,
+      termId,
       message: 'تم تسجيل التسميع بنجاح',
     };
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // CREATE BATCH (UNCHANGED)
+  // CREATE BATCH — multi-segment session. VERSE RANGE ONLY.
+  //
+  // Every segment is surah + startAya + endAya. A FULL_SURA segment from an
+  // older client is refused with FULL_SURA_RETIRED_MESSAGE, naming the
+  // segment position so the instructor knows which row to fix.
   // ─────────────────────────────────────────────────────────────────
 
   async createBatch(
@@ -444,6 +445,7 @@ export class RecitationService {
     });
     if (!student) throw new NotFoundException('الطالب غير موجود');
 
+    const termId = await this.termsService.requireActiveTermId();
     const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
     const recitationDate = new Date(dto.date);
 
@@ -461,6 +463,7 @@ export class RecitationService {
           rating: dto.rating!,
           homework: dto.homework || null,
           date: recitationDate,
+          termId,
           startSurah: 1,
           startAya: 1,
           endSurah: 1,
@@ -495,35 +498,34 @@ export class RecitationService {
       }
 
       if (seg.type === BatchSegmentType.FULL_SURA) {
-        if (!Array.isArray(seg.surahNumbers) || seg.surahNumbers.length === 0) {
-          throw new BadRequestException(
-            `المقطع ${pos}: يجب اختيار سورة واحدة على الأقل`,
-          );
-        }
-        for (const n of seg.surahNumbers) {
-          if (typeof n !== 'number' || !getSuraByNumber(n)) {
-            throw new BadRequestException(
-              `المقطع ${pos}: رقم السورة غير صالح: ${n}`,
-            );
-          }
-        }
-      } else if (seg.type === BatchSegmentType.AYA_RANGE) {
-        const s = seg.startSurah;
-        const sa = seg.startAya;
-        const ea = seg.endAya;
-        if (typeof s !== 'number' || typeof sa !== 'number' || typeof ea !== 'number') {
-          throw new BadRequestException(
-            `المقطع ${pos}: بيانات نطاق الآيات غير كاملة`,
-          );
-        }
-        const v = validateRange(s, sa, s, ea);
-        if (!v.valid) {
-          throw new BadRequestException(`المقطع ${pos}: ${v.error}`);
-        }
-      } else {
+        throw new BadRequestException(
+          `المقطع ${pos}: ${FULL_SURA_RETIRED_MESSAGE}`,
+        );
+      }
+      if (seg.type !== BatchSegmentType.AYA_RANGE) {
         throw new BadRequestException(
           `المقطع ${pos}: نوع غير معروف (${seg.type})`,
         );
+      }
+
+      const s = seg.startSurah;
+      const sa = seg.startAya;
+      const ea = seg.endAya;
+      if (
+        typeof s !== 'number' ||
+        typeof sa !== 'number' ||
+        typeof ea !== 'number'
+      ) {
+        throw new BadRequestException(
+          `المقطع ${pos}: يجب تحديد السورة و«من آية» و«إلى آية»`,
+        );
+      }
+      if (!getSuraByNumber(s)) {
+        throw new BadRequestException(`المقطع ${pos}: رقم السورة غير صالح: ${s}`);
+      }
+      const v = validateRange(s, sa, s, ea);
+      if (!v.valid) {
+        throw new BadRequestException(`المقطع ${pos}: ${v.error}`);
       }
     }
 
@@ -531,7 +533,7 @@ export class RecitationService {
       recId: string;
       rating: string;
       pages: number;
-      isAyaRange: boolean;
+      verseCount: number;
     };
 
     const { created, segmentMeta } = await this.prisma.$transaction(
@@ -541,69 +543,44 @@ export class RecitationService {
 
         for (const seg of dto.segments) {
           const segRating = seg.rating as string;
+          const s: number = seg.startSurah!;
+          const sa: number = seg.startAya!;
+          const ea: number = seg.endAya!;
 
-          if (seg.type === BatchSegmentType.FULL_SURA) {
-            const nums: number[] = seg.surahNumbers!;
-            const rawPages = nums.reduce(
-              (sum, n) => sum + (getSuraByNumber(n)?.totalPages ?? 0),
-              0,
-            );
-            const pages = Math.round(rawPages * 100) / 100;
+          // One measurement for every segment: the exact mushaf page span of
+          // the ayat actually recited. Nothing here depends on which surah it
+          // is or on whether the range happens to cover the whole surah.
+          const pages = calculatePages(s, sa, s, ea);
+          const verseCount = getVerseCount(sa, ea);
+          const pagesDec = new Prisma.Decimal(pages.toFixed(3));
+          const sMeta = getSurahMeta(s)!;
 
-            const rec = await tx.recitation.create({
-              data: {
-                studentId: dto.studentId,
-                instructorId,
-                surahNumber: nums[0],
-                surahNumbers: nums,
-                pagesRecited: pages,
-                isCompleteSura: true,
-                rating: segRating as any,
-                homework: null,
-                date: recitationDate,
-              },
-            });
-            rows.push(rec);
-            meta.push({
-              recId: rec.id,
-              rating: segRating,
-              pages,
-              isAyaRange: false,
-            });
-          } else {
-            const s: number = seg.startSurah!;
-            const sa: number = seg.startAya!;
-            const ea: number = seg.endAya!;
-            const pages = calculatePages(s, sa, s, ea);
-            const pagesDec = new Prisma.Decimal(pages.toFixed(3));
-            const sMeta = getSurahMeta(s)!;
-
-            const rec = await tx.recitation.create({
-              data: {
-                studentId: dto.studentId,
-                instructorId,
-                surahNumber: s,
-                surahNumbers: [s],
-                pagesRecited: Math.max(1, Math.round(pages)),
-                isCompleteSura: sa === 1 && ea >= sMeta.numAyas,
-                rating: segRating as any,
-                homework: null,
-                date: recitationDate,
-                startSurah: s,
-                startAya: sa,
-                endSurah: s,
-                endAya: ea,
-                pagesCalculated: pagesDec,
-              },
-            });
-            rows.push(rec);
-            meta.push({
-              recId: rec.id,
-              rating: segRating,
-              pages,
-              isAyaRange: true,
-            });
-          }
+          const rec = await tx.recitation.create({
+            data: {
+              studentId: dto.studentId,
+              instructorId,
+              surahNumber: s,
+              surahNumbers: [s],
+              pagesRecited: Math.max(1, Math.round(pages)),
+              isCompleteSura: sa === 1 && ea >= sMeta.numAyas,
+              rating: segRating as any,
+              homework: null,
+              date: recitationDate,
+              termId,
+              startSurah: s,
+              startAya: sa,
+              endSurah: s,
+              endAya: ea,
+              pagesCalculated: pagesDec,
+            },
+          });
+          rows.push(rec);
+          meta.push({
+            recId: rec.id,
+            rating: segRating,
+            pages,
+            verseCount,
+          });
         }
 
         if (dto.homework && rows.length > 0) {
@@ -619,39 +596,40 @@ export class RecitationService {
     );
 
     for (const m of segmentMeta) {
-      if (m.isAyaRange) {
-        await this.applyNewFormatPoints(
-          dto.studentId,
-          instructorId,
-          m.rating,
-          m.pages,
-          m.recId,
-          pointsCreatedAt,
-        );
-      } else {
-        await this.applyRecitationPoints(
-          dto.studentId,
-          instructorId,
-          m.rating,
-          m.pages,
-          m.recId,
-          pointsCreatedAt,
-        );
-      }
+      await this.applyRangePoints(
+        dto.studentId,
+        instructorId,
+        m.rating,
+        m.pages,
+        m.recId,
+        pointsCreatedAt,
+        termId,
+      );
     }
 
     const totalPages = segmentMeta.reduce((s, m) => s + m.pages, 0);
+    const totalVerses = segmentMeta.reduce((s, m) => s + m.verseCount, 0);
 
     return {
       data: created,
       count: created.length,
       totalPages: Math.round(totalPages * 100) / 100,
+      totalVerses,
+      termId,
       message: 'تم تسجيل التسميع بنجاح',
     };
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // BULK MAQRAA (UNCHANGED)
+  // BULK MAQRAA — a marker, not a score.
+  //
+  // A مقرأة is group reading with the instructor. It tells parents that a
+  // session happened today; it is not memorisation and it awards NO points,
+  // neither positive nor negative. It therefore also carries no verse range,
+  // which is why `recitations_verse_range_chk` exempts rating = 'MAQRAA'.
+  //
+  // Historical MAQRAA points rows are left exactly as they are — this only
+  // changes what happens from now on.
   // ─────────────────────────────────────────────────────────────────
 
   async createBulkMaqraa(dto: BulkMaqraaDto, instructorId: string) {
@@ -661,40 +639,39 @@ export class RecitationService {
     if (!sura) {
       throw new BadRequestException(`رقم السورة غير صالح: ${dto.surahNumber}`);
     }
-
-    const pointsCreatedAt = this.composePointsCreatedAt(dto.date);
-    const results = [];
-
-    for (const studentId of dto.studentIds) {
-      const recitation = await this.prisma.recitation.create({
-        data: {
-          studentId,
-          instructorId,
-          surahNumber: dto.surahNumber,
-          surahNumbers: [dto.surahNumber],
-          pagesRecited: dto.pagesRecited || 0,
-          isCompleteSura: false,
-          rating: 'MAQRAA',
-          date: new Date(dto.date),
-        },
-      });
-
-      await this.applyRecitationPoints(
-        studentId,
-        instructorId,
-        'MAQRAA',
-        dto.pagesRecited || 0,
-        recitation.id,
-        pointsCreatedAt,
-      );
-
-      results.push(recitation);
+    if (!Array.isArray(dto.studentIds) || dto.studentIds.length === 0) {
+      throw new BadRequestException('يجب اختيار طالب واحد على الأقل');
     }
+
+    const termId = await this.termsService.requireActiveTermId();
+    const recitationDate = new Date(dto.date);
+
+    // One transaction: either the whole group is marked or none of it is, so
+    // a mid-loop failure can never leave half a حلقة recorded.
+    const results = await this.prisma.$transaction(
+      dto.studentIds.map((studentId) =>
+        this.prisma.recitation.create({
+          data: {
+            studentId,
+            instructorId,
+            surahNumber: dto.surahNumber,
+            surahNumbers: [dto.surahNumber],
+            pagesRecited: dto.pagesRecited || 0,
+            isCompleteSura: false,
+            rating: 'MAQRAA',
+            date: recitationDate,
+            termId,
+          },
+        }),
+      ),
+    );
 
     return {
       data: results,
       count: results.length,
       suraName: sura.nameAr,
+      pointsAwarded: 0,
+      termId,
       message: `تم تسجيل المقرأة لـ ${results.length} طالب`,
     };
   }
@@ -728,22 +705,30 @@ export class RecitationService {
     return `تسميع ${safePages.toFixed(2)} صفحة — ${ratingAr}`;
   }
 
-  private async applyNewFormatPoints(
+  /**
+   * The single write path for recitation points.
+   *
+   * Input is always a page span measured from a verse range, so two students
+   * who recited the same ayat receive byte-for-byte the same amount. Per-page
+   * rates come from the admin-editable `point_rules` table so an edit on the
+   * rules screen applies everywhere; calculatePoints() remains only as a
+   * fallback when no matching active rule exists, which preserves the
+   * previous behaviour instead of silently awarding nothing.
+   *
+   * `termId` is passed in rather than left to the DB trigger: the points row
+   * must land in the same course as the recitation that produced it, even if
+   * an admin activates a different course mid-request.
+   */
+  private async applyRangePoints(
     studentId: string,
     instructorId: string,
     rating: string,
     pages: number,
     sourceId: string,
     createdAt: Date,
+    termId: number,
   ) {
     try {
-      // --- SINGLE SOURCE OF TRUTH ---------------------------------
-      // Per-page rates come from the admin-editable point_rules table,
-      // exactly as the full-sura path does, so an edit on the rules
-      // screen applies to BOTH write paths. calculatePoints() remains
-      // only as a fallback when no matching active rule exists, which
-      // preserves the previous behaviour instead of silently awarding
-      // nothing.
       const ruleResult = await this.pointRulesService.getRecitationPoints(
         rating,
         pages,
@@ -755,7 +740,10 @@ export class RecitationService {
       if (!amount || amount <= 0) return;
 
       const category = await this.findRecitationCategory();
-      if (!category) return;
+      if (!category) {
+        console.error('[applyRangePoints] No PointCategory found in DB');
+        return;
+      }
 
       await this.prisma.pointsLog.create({
         data: {
@@ -767,103 +755,21 @@ export class RecitationService {
           awardedBy: instructorId,
           sourceId,
           sourceType: 'RECITATION',
+          termId,
           createdAt,
         },
       });
     } catch (error) {
-      console.error('Error applying new-format recitation points:', error);
+      console.error('[applyRangePoints] Error applying recitation points:', error);
     }
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // POINTS — legacy per-rule (UNCHANGED)
-  // ─────────────────────────────────────────────────────────────────
-
-  private async applyRecitationPoints(
-    studentId: string,
-    instructorId: string,
-    rating: string,
-    pageCount: number,
-    sourceId: string,
-    createdAt: Date,
-  ) {
-    try {
-      if (
-        rating === 'REPEAT' ||
-        rating === 'DID_NOT_MEMORIZE' ||
-        pageCount <= 0
-      ) {
-        return;
-      }
-
-      let pointResult: { points: number; ruleNameAr: string } | null = null;
-
-      if (rating === 'MAQRAA') {
-        const maqraaRule =
-          await this.pointRulesService.findByCode('RECITE_MAQRAA');
-        if (maqraaRule && maqraaRule.isActive) {
-          const rulePoints = Number(maqraaRule.points);
-          const pts = maqraaRule.isPerPage
-            ? rulePoints * pageCount
-            : rulePoints;
-          pointResult = { points: pts, ruleNameAr: maqraaRule.nameAr };
-        }
-      } else {
-        const raw = await this.pointRulesService.getRecitationPoints(
-          rating,
-          pageCount,
-        );
-        if (raw) {
-          pointResult = {
-            points: Number(raw.points),
-            ruleNameAr: raw.ruleNameAr,
-          };
-        }
-      }
-
-      if (
-        !pointResult ||
-        pointResult.points === null ||
-        pointResult.points === undefined ||
-        isNaN(pointResult.points) ||
-        pointResult.points === 0
-      ) {
-        console.warn(
-          `[applyRecitationPoints] No points awarded — rating=${rating} pages=${pageCount} result=${JSON.stringify(pointResult)}`,
-        );
-        return;
-      }
-
-      const category = await this.findRecitationCategory();
-      if (!category) {
-        console.error('[applyRecitationPoints] No PointCategory found in DB');
-        return;
-      }
-
-      await this.prisma.pointsLog.create({
-        data: {
-          studentId,
-          categoryId: category.id,
-          amount: new Prisma.Decimal(pointResult.points.toFixed(3)),
-          rating: rating as any,
-          description: this.buildRecitationDescription(pageCount, rating),
-          awardedBy: instructorId,
-          sourceId,
-          sourceType: 'RECITATION',
-          createdAt,
-        },
-      });
-
-      console.log(
-        `[applyRecitationPoints] ✅ Awarded ${pointResult.points} pts to student ${studentId} for ${rating}`,
-      );
-    } catch (error) {
-      console.error('[applyRecitationPoints] ❌ Error:', error);
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────
-  // NEXT-AYA SUGGESTION (UNCHANGED)
+  // NEXT-AYA SUGGESTION
+  //
+  // Deliberately NOT course-scoped: memorisation carries across courses, so
+  // a student who finished الملك last term continues from where they left
+  // off, not from الفاتحة. Only points restart with a new course.
   // ─────────────────────────────────────────────────────────────────
 
   async getNextSuggestion(studentId: string) {
@@ -1067,10 +973,19 @@ export class RecitationService {
     );
   }
 
-  async getStudentRecitations(studentId: string) {
+  async getStudentRecitations(
+    studentId: string,
+    params?: { termId?: number | null },
+  ) {
+    // Course-scoped like every other points-facing read: `?termId=0` returns
+    // the full history, a specific id returns that course, absent returns the
+    // active one.
+    const resolvedTermId = await this.resolveTermId(params?.termId);
+    const termWhere = resolvedTermId == null ? {} : { termId: resolvedTermId };
+
     const [recitations, lastMap] = await Promise.all([
       this.prisma.recitation.findMany({
-        where: { studentId },
+        where: { studentId, ...termWhere },
         orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
       }),
       this.buildLastRecitationFor([studentId]),
@@ -1114,7 +1029,7 @@ export class RecitationService {
     // timeline. hadith_recitations has no calendar date column, only
     // createdAt, so these group by the day they were recorded.
     const hadithRows = await this.prisma.hadithRecitation.findMany({
-      where: { studentId },
+      where: { studentId, ...termWhere },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -1142,6 +1057,7 @@ export class RecitationService {
     return {
       data,
       hadithEntries,
+      termId: resolvedTermId,
       lastRecitation: lastMap.get(studentId) ?? null,
     };
   }
@@ -1190,7 +1106,10 @@ export class RecitationService {
   // than shipping the leaderboard to the device keeps every other
   // student name and total on the server.
   // ---------------------------------------------------------------
-  private async buildRosterMetrics(studentIds: string[]): Promise<{
+  private async buildRosterMetrics(
+    studentIds: string[],
+    termId?: number | null,
+  ): Promise<{
     points: Map<string, number>;
     rank: Map<string, number>;
     lastAttendance: Map<string, Date | null>;
@@ -1212,7 +1131,7 @@ export class RecitationService {
     // Ranking is delegated to PointsService, which owns the single
     // implementation. A local copy here would drift from the leaderboard
     // and from the detail screen the moment either changed.
-    const ranking = await this.pointsService.getMosqueRanking();
+    const ranking = await this.pointsService.getMosqueRanking(termId);
     mosqueTotal = ranking.total;
     for (const id of studentIds) {
       points.set(id, ranking.totals.get(id) ?? 0);
@@ -1234,8 +1153,12 @@ export class RecitationService {
     return { points, rank, lastAttendance, total: mosqueTotal };
   }
 
-  async getInstructorOverview(instructorId: string) {
+  async getInstructorOverview(
+    instructorId: string,
+    params?: { termId?: number | null },
+  ) {
     instructorId = await this.resolveInstructorId(instructorId);
+    const resolvedTermId = await this.resolveTermId(params?.termId);
 
     const students = await this.prisma.student.findMany({
       where: { instructorId, deletedAt: null },
@@ -1250,6 +1173,7 @@ export class RecitationService {
 
     const metrics = await this.buildRosterMetrics(
       students.map((s) => s.id),
+      resolvedTermId,
     );
 
     const overview = [];
@@ -1320,9 +1244,14 @@ export class RecitationService {
       });
     }
 
-    return { data: overview };
+    return { data: overview, termId: resolvedTermId };
   }
 
+  /**
+   * Surah list for the recitation form. `numAyas` is included so the picker
+   * can show each surah's real ayah count and cap the "إلى آية" stepper at it
+   * — the same ceiling validateRange() enforces on the way in.
+   */
   getSuraList() {
     return {
       data: SURA_METADATA.map((s) => ({
@@ -1330,6 +1259,7 @@ export class RecitationService {
         nameAr: s.nameAr,
         totalPages: s.totalPages,
         juz: s.juzStart,
+        numAyas: getSurahMeta(s.number)?.numAyas ?? 0,
       })),
     };
   }
@@ -1372,6 +1302,7 @@ export class RecitationService {
     instructorId: string,
   ) {
     instructorId = await this.resolveInstructorId(instructorId);
+    const termId = await this.termsService.requireActiveTermId();
 
     try {
       const recitation = await this.prisma.$transaction(async (tx) => {
@@ -1390,14 +1321,16 @@ export class RecitationService {
 
         const basePoints = rule.basePoints;
 
-        // 1) hadith_recitations — termId left null; the set_term_id_to_active
-        //    trigger stamps the active term on insert.
+        // 1) hadith_recitations — the course is resolved in the application
+        //    layer (see applyRangePoints) so the recitation row and its
+        //    points row can never land in two different courses.
         const created = await tx.hadithRecitation.create({
           data: {
             studentId: dto.studentId,
             instructorId,
             hadithNumber: dto.hadithNumber,
             pointsAwarded: basePoints,
+            termId,
           },
         });
 
@@ -1411,6 +1344,7 @@ export class RecitationService {
             awardedBy: instructorId,
             sourceId: created.id,
             sourceType: 'HADITH_RECITATION',
+            termId,
           },
         });
 

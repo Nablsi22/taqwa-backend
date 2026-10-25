@@ -10,6 +10,7 @@ import {
   UseGuards,
   Request,
   ParseUUIDPipe,
+  BadRequestException,
 } from '@nestjs/common';
 import { PointsService } from './points.service';
 import { AwardPointsDto } from './dto/award-points.dto';
@@ -17,6 +18,25 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { UpdateCategoryDto } from './dto/update-category.dto';
+
+/**
+ * Parse the `termId` query parameter shared by every read endpoint below.
+ *
+ *   absent  → undefined → the service falls back to the ACTIVE course
+ *   0       → no course filter (admin viewing the full history)
+ *   > 0     → that specific course
+ *
+ * `undefined` and `0` are different answers, so a truthiness check would be
+ * wrong here.
+ */
+function parseTermId(raw?: string): number | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestException('قيمة غير صالحة للمعامل termId');
+  }
+  return n;
+}
 
 @Controller('api/v1/points')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -77,9 +97,12 @@ export class PointsController {
    * never in question.
    */
   @Get('student/:studentId/rank')
-  @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT')
-  getStudentRank(@Param('studentId', ParseUUIDPipe) studentId: string) {
-    return this.pointsService.getStudentRank(studentId);
+  @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT', 'SUPERVISOR')
+  getStudentRank(
+    @Param('studentId', ParseUUIDPipe) studentId: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.pointsService.getStudentRank(studentId, parseTermId(termId));
   }
 
   /**
@@ -87,15 +110,17 @@ export class PointsController {
    * Get points history for a student
    */
   @Get('student/:studentId')
-  @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT')
+  @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT', 'SUPERVISOR')
   getStudentPoints(
     @Param('studentId', ParseUUIDPipe) studentId: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('termId') termId?: string,
   ) {
     return this.pointsService.getStudentPoints(studentId, {
       page: page ? parseInt(page, 10) : 1,
       limit: limit ? parseInt(limit, 10) : 30,
+      termId: parseTermId(termId),
     });
   }
 
@@ -107,10 +132,12 @@ export class PointsController {
   getLeaderboard(
     @Query('limit') limit?: string,
     @Query('instructorId') instructorId?: string,
+    @Query('termId') termId?: string,
   ) {
     return this.pointsService.getLeaderboard({
       limit: limit ? parseInt(limit, 10) : 20,
       instructorId,
+      termId: parseTermId(termId),
     });
   }
 
