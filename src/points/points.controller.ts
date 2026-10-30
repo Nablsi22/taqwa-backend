@@ -74,6 +74,8 @@ export class PointsController {
    *      Amount and description come from the rule. Locked.
    *   2. Custom:      { studentId, amount, reason }
    *      Free amount, REQUIRED reason. Sign of amount = earn/deduct.
+   *
+   * Optional in both modes: `date` ('YYYY-MM-DD', «تاريخ التسجيل»).
    */
   @Post('manual')
   @Roles('ADMIN', 'INSTRUCTOR')
@@ -84,6 +86,7 @@ export class PointsController {
         ruleId: body?.ruleId,
         amount: body?.amount,
         reason: body?.reason,
+        date: body?.date,
       },
       req.user.id,
     );

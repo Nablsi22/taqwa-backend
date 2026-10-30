@@ -18,6 +18,8 @@ export interface AwardManualPointsInput {
   ruleId?: string;
   amount?: number;
   reason?: string;
+  /** «تاريخ التسجيل» 'YYYY-MM-DD'; absent = now. */
+  date?: string | null;
 }
 
 @Injectable()
@@ -94,6 +96,8 @@ export class PointsService {
     // is part of what this endpoint means, and a missing active course must
     // fail with an actionable message, not a constraint violation.
     const termId = await this.termsService.requireActiveTermId();
+    // «تاريخ التسجيل» — undefined keeps the database default (now).
+    const createdAt = await this.termsService.resolveRecordTimestamp(dto.date);
 
     const log = await this.prisma.pointsLog.create({
       data: {
@@ -105,6 +109,7 @@ export class PointsService {
         awardedBy: awardedByUserId,
         sourceType: 'MANUAL',
         termId,
+        ...(createdAt && { createdAt }),
       },
       include: {
         student: { select: { fullName: true } },
@@ -210,6 +215,10 @@ export class PointsService {
     }
 
     const termId = await this.termsService.requireActiveTermId();
+    // «تاريخ التسجيل» — undefined keeps the database default (now).
+    const createdAt = await this.termsService.resolveRecordTimestamp(
+      input.date,
+    );
 
     const log = await this.prisma.pointsLog.create({
       data: {
@@ -220,6 +229,7 @@ export class PointsService {
         awardedBy: awardedByUserId,
         sourceType: 'MANUAL',
         termId,
+        ...(createdAt && { createdAt }),
       },
       include: { student: { select: { fullName: true } } },
     });

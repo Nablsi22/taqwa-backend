@@ -21,6 +21,35 @@ import * as bcrypt from 'bcrypt';
  */
 const ACTIVE_STUDENT_FILTER = { deletedAt: null } as const;
 
+/**
+ * An instructor whose account has not been archived (see remove()). Every
+ * read and write in this service goes through it, so an archived instructor
+ * can be neither listed, edited nor have a password reset.
+ */
+const ACTIVE_INSTRUCTOR_FILTER: Prisma.InstructorWhereInput = {
+  user: { deletedAt: null },
+};
+
+/**
+ * Prisma P2003 — a foreign-key constraint refused the write.
+ * Ref: https://www.prisma.io/docs/orm/reference/error-reference#p2003
+ */
+function isForeignKeyViolation(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === 'P2003'
+  );
+}
+
+/**
+ * The username an archived account is renamed to. Releases the original for
+ * a new account (users.username is UNIQUE) while staying unique itself and
+ * recognisable to anyone reading the table.
+ */
+function archivedUsername(username: string, userId: string): string {
+  return `${username}#deleted-${userId.slice(0, 8)}`;
+}
+
 @Injectable()
 export class InstructorsService {
   constructor(private readonly prisma: PrismaService) {}
@@ -41,7 +70,7 @@ export class InstructorsService {
     const limit = Math.min(500, Math.max(1, params?.limit ?? 50));
     const skip = (page - 1) * limit;
 
-    const where: Prisma.InstructorWhereInput = {};
+    const where: Prisma.InstructorWhereInput = { ...ACTIVE_INSTRUCTOR_FILTER };
 
     if (search) {
       where.OR = [
@@ -113,8 +142,8 @@ export class InstructorsService {
    * Get single instructor by ID with full details and ACTIVE student list.
    */
   async findOne(id: string) {
-    const instructor = await this.prisma.instructor.findUnique({
-      where: { id },
+    const instructor = await this.prisma.instructor.findFirst({
+      where: { id, ...ACTIVE_INSTRUCTOR_FILTER },
       select: {
         id: true,
         fullName: true,
@@ -226,8 +255,8 @@ export class InstructorsService {
    * Update instructor details.
    */
   async update(id: string, dto: UpdateInstructorDto) {
-    const existing = await this.prisma.instructor.findUnique({
-      where: { id },
+    const existing = await this.prisma.instructor.findFirst({
+      where: { id, ...ACTIVE_INSTRUCTOR_FILTER },
       include: { user: true },
     });
 
@@ -304,12 +333,33 @@ export class InstructorsService {
   }
 
   /**
-   * Delete instructor — only if they have no active students.
+   * Delete an instructor (admin action).
+   *
+   * Refused while the instructor still teaches active students: they have
+   * to be moved to another حلقة first.
+   *
+   * Otherwise the outcome depends on whether the account left any history:
+   *
+   *   • No history at all (an account created by mistake, never used) →
+   *     the user and instructor rows are removed for good.
+   *
+   *   • Any history → the account is ARCHIVED instead: sign-in is disabled,
+   *     it disappears from every list, and its username is released for
+   *     reuse. The instructor row stays because old records still point at
+   *     it — soft-deleted students (students.instructor_id, ON DELETE
+   *     RESTRICT), instructor attendance (RESTRICT), and the recitations,
+   *     points and attendance marks whose «سجّلها» name is resolved from
+   *     it. A hard delete used to hit those foreign keys and surface as an
+   *     unhandled 500; deleting the records instead would rewrite history,
+   *     which the course archive must never do.
    */
   async remove(id: string) {
-    const instructor = await this.prisma.instructor.findUnique({
-      where: { id },
-      include: {
+    const instructor = await this.prisma.instructor.findFirst({
+      where: { id, ...ACTIVE_INSTRUCTOR_FILTER },
+      select: {
+        id: true,
+        userId: true,
+        user: { select: { username: true } },
         _count: {
           select: {
             students: { where: ACTIVE_STUDENT_FILTER },
@@ -328,22 +378,88 @@ export class InstructorsService {
       );
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.instructor.delete({ where: { id } });
-      await tx.user.delete({ where: { id: instructor.userId } });
+    if (!(await this.hasHistory(instructor.id, instructor.userId))) {
+      try {
+        await this.prisma.$transaction(async (tx) => {
+          // halaqa_coverage rows follow via ON DELETE CASCADE.
+          await tx.instructor.delete({ where: { id: instructor.id } });
+          await tx.user.delete({ where: { id: instructor.userId } });
+        });
+        return { message: 'تم حذف المعلم بنجاح', archived: false };
+      } catch (error) {
+        // A reference hasHistory() does not know about yet: archive rather
+        // than fail. Anything else is a genuine error.
+        if (!isForeignKeyViolation(error)) throw error;
+      }
+    }
+
+    await this.prisma.user.update({
+      where: { id: instructor.userId },
+      data: {
+        deletedAt: new Date(),
+        isActive: false,
+        fcmToken: null,
+        username: archivedUsername(instructor.user.username, instructor.userId),
+      },
     });
 
     return {
-      message: 'تم حذف المعلم بنجاح',
+      message:
+        'تم حذف المعلم بنجاح، وبقي سجلّه السابق (التسميع والنقاط والحضور) محفوظاً كما هو.',
+      archived: true,
     };
+  }
+
+  /**
+   * Whether anything in the database still refers to this instructor.
+   *
+   * Writers store either id depending on the endpoint (recitations and
+   * hadith use the instructor id; points, attendance marks and notifications
+   * the user id), so both are checked wherever either can appear.
+   */
+  private async hasHistory(
+    instructorId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const either = { in: [instructorId, userId] };
+    const counts = await Promise.all([
+      // Soft-deleted students included: they still reference the حلقة.
+      this.prisma.student.count({ where: { instructorId } }),
+      this.prisma.instructorAttendance.count({ where: { instructorId } }),
+      this.prisma.halaqaCoverage.count({
+        where: {
+          OR: [
+            { halaqaInstructorId: instructorId },
+            { coveringInstructorId: instructorId },
+          ],
+        },
+      }),
+      this.prisma.tempAssignment.count({
+        where: {
+          OR: [
+            { originalInstructorId: instructorId },
+            { tempInstructorId: instructorId },
+          ],
+        },
+      }),
+      this.prisma.recitation.count({ where: { instructorId: either } }),
+      this.prisma.hadithRecitation.count({ where: { instructorId: either } }),
+      this.prisma.pointsLog.count({ where: { awardedBy: either } }),
+      this.prisma.attendance.count({ where: { markedBy: either } }),
+      this.prisma.announcement.count({ where: { createdBy: userId } }),
+      this.prisma.notification.count({ where: { senderId: either } }),
+      this.prisma.scheduledNotification.count({ where: { userId } }),
+      this.prisma.media.count({ where: { uploadedBy: either } }),
+    ]);
+    return counts.some((n) => n > 0);
   }
 
   /**
    * Reset instructor password (admin action).
    */
   async resetPassword(id: string, newPassword: string) {
-    const instructor = await this.prisma.instructor.findUnique({
-      where: { id },
+    const instructor = await this.prisma.instructor.findFirst({
+      where: { id, ...ACTIVE_INSTRUCTOR_FILTER },
     });
 
     if (!instructor) {

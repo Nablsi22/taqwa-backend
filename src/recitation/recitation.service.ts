@@ -1303,6 +1303,10 @@ export class RecitationService {
   ) {
     instructorId = await this.resolveInstructorId(instructorId);
     const termId = await this.termsService.requireActiveTermId();
+    // «تاريخ التسجيل»: hadith_recitations has no date column, so the chosen
+    // day is carried by created_at on BOTH rows (recitation + points), which
+    // is what every history screen groups by. undefined = now.
+    const createdAt = await this.termsService.resolveRecordTimestamp(dto.date);
 
     try {
       const recitation = await this.prisma.$transaction(async (tx) => {
@@ -1331,6 +1335,7 @@ export class RecitationService {
             hadithNumber: dto.hadithNumber,
             pointsAwarded: basePoints,
             termId,
+            ...(createdAt && { createdAt }),
           },
         });
 
@@ -1345,6 +1350,7 @@ export class RecitationService {
             sourceId: created.id,
             sourceType: 'HADITH_RECITATION',
             termId,
+            ...(createdAt && { createdAt }),
           },
         });
 

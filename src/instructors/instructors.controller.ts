@@ -79,7 +79,8 @@ export class InstructorsController {
 
   /**
    * DELETE /api/v1/instructors/:id
-   * Delete instructor (only if no students assigned)
+   * Delete instructor (only if no active students). An account with
+   * history is archived rather than removed — see InstructorsService.remove.
    */
   @Delete(':id')
   @Roles('ADMIN')

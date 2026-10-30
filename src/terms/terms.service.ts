@@ -6,6 +6,12 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateTermDto } from './dto/create-term.dto';
 import { UpdateTermDto } from './dto/update-term.dto';
+import { ATTENDANCE_RULES } from '../attendance-stats/attendance-stats.rules';
+import { localToday, toCalendarDay } from '../attendance-stats/meeting-days';
+import {
+  composeRecordTimestamp,
+  parseCalendarDay,
+} from '../common/record-date.util';
 
 /**
  * Validated meeting days, sorted. A weekday cannot be both required and
@@ -29,6 +35,9 @@ export class TermsService {
    */
   private cache: { termId: number | null; expiresAt: number } | null = null;
   private static readonly CACHE_TTL_MS = 30_000;
+
+  private static readonly NO_ACTIVE_TERM_MESSAGE =
+    'لا توجد دورة مفعّلة حالياً. يرجى تفعيل دورة من شاشة إدارة الدورات قبل تسجيل أي نقاط أو تسميع.';
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -64,15 +73,62 @@ export class TermsService {
   async requireActiveTermId(): Promise<number> {
     const id = await this.getActiveTermId();
     if (id == null) {
-      throw new BadRequestException(
-        'لا توجد دورة مفعّلة حالياً. يرجى تفعيل دورة من شاشة إدارة الدورات قبل تسجيل أي نقاط أو تسميع.',
-      );
+      throw new BadRequestException(TermsService.NO_ACTIVE_TERM_MESSAGE);
     }
     return id;
   }
 
   invalidateCache(): void {
     this.cache = null;
+  }
+
+  /**
+   * «تاريخ التسجيل» for writes whose only date is `created_at` — manual
+   * points and Nawawi hadith — mirroring the date a recitation carries.
+   *
+   *   absent / today → undefined: the row keeps the database default now(),
+   *                    which is exactly what every older APK gets.
+   *   an earlier day → that day at the current Damascus time of day
+   *                    (see composeRecordTimestamp).
+   *
+   * The day must fall inside the ACTIVE course, because the row is filed
+   * under that course: a day before it started would place the entry in the
+   * wrong course's history. A future day is refused.
+   */
+  async resolveRecordTimestamp(day?: string | null): Promise<Date | undefined> {
+    if (day === undefined || day === null || day === '') return undefined;
+
+    if (typeof day !== 'string' || !parseCalendarDay(day)) {
+      throw new BadRequestException(
+        'صيغة التاريخ غير صحيحة. يرجى اختيار التاريخ من التقويم.',
+      );
+    }
+
+    const timeZone = ATTENDANCE_RULES.localTimeZone;
+    const today = localToday(timeZone);
+    if (day > today) {
+      throw new BadRequestException(
+        'لا يمكن التسجيل بتاريخ لاحق لتاريخ اليوم.',
+      );
+    }
+    if (day === today) return undefined;
+
+    const term = await this.prisma.term.findFirst({
+      where: { isActive: true },
+      select: { nameAr: true, startDate: true },
+    });
+    if (!term) {
+      throw new BadRequestException(TermsService.NO_ACTIVE_TERM_MESSAGE);
+    }
+
+    const courseStart = toCalendarDay(term.startDate);
+    if (day < courseStart) {
+      throw new BadRequestException(
+        `التاريخ المختار يسبق بداية الدورة الحالية «${term.nameAr}» التي بدأت في ${courseStart}. يرجى اختيار تاريخ من داخل الدورة.`,
+      );
+    }
+
+    return composeRecordTimestamp(day, timeZone);
   }
 
   /**

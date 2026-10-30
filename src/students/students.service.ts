@@ -250,8 +250,9 @@ export class StudentsService {
   }
 
   async create(dto: CreateStudentDto, createdByUserId: string) {
-    const instructor = await this.prisma.instructor.findUnique({
-      where: { id: dto.instructorId },
+    // An archived (deleted) instructor cannot receive students.
+    const instructor = await this.prisma.instructor.findFirst({
+      where: { id: dto.instructorId, user: { deletedAt: null } },
     });
     if (!instructor) {
       throw new BadRequestException('المعلم غير موجود');
@@ -472,6 +473,7 @@ export class StudentsService {
           _count: { _all: true },
         }),
         this.prisma.instructor.findMany({
+          where: { user: { deletedAt: null } },
           select: { id: true, fullName: true },
           orderBy: { fullName: 'asc' },
         }),
@@ -574,8 +576,8 @@ export class StudentsService {
     }
 
     if (dto.instructorId) {
-      const instructor = await this.prisma.instructor.findUnique({
-        where: { id: dto.instructorId },
+      const instructor = await this.prisma.instructor.findFirst({
+        where: { id: dto.instructorId, user: { deletedAt: null } },
       });
       if (!instructor) {
         throw new BadRequestException('المعلم غير موجود');
