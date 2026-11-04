@@ -18,6 +18,7 @@ import {
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { OwnStudentGuard } from '../auth/guards/own-student.guard';
 
 @Controller('api/v1/attendance')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -63,6 +64,7 @@ export class AttendanceController {
   // GET /api/v1/attendance/student/:studentId
   @Get('student/:studentId')
   @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT')
+  @UseGuards(OwnStudentGuard)
   getStudentHistory(
     @Param('studentId', ParseUUIDPipe) studentId: string,
     @Query('page') page?: string,

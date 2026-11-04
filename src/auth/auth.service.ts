@@ -3,7 +3,9 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import * as bcrypt from 'bcrypt';
+import { randomBytes } from 'node:crypto';
 import { LoginDto } from './dto/login.dto';
+import { LoginAttemptsService } from './login-attempts.service';
 
 import { resolveTtl } from './jwt-ttl.util';
 @Injectable()
@@ -12,9 +14,23 @@ export class AuthService {
     private prisma: PrismaService,
     private jwt: JwtService,
     private config: ConfigService,
+    private attempts: LoginAttemptsService,
   ) {}
 
+  /**
+   * Compared against when the username does not exist, so a wrong username
+   * costs the same bcrypt time as a wrong password and the answer's timing
+   * does not reveal which usernames exist. Same cost (12) as stored hashes.
+   */
+  private static readonly unknownUserHash: Promise<string> = bcrypt.hash(
+    randomBytes(32).toString('hex'),
+    12,
+  );
+
   async login(dto: LoginDto) {
+    // A username that has had too many wrong passwords waits (429).
+    this.attempts.assertAllowed(dto.username);
+
     // Find user by username
     const user = await this.prisma.user.findUnique({
       where: { username: dto.username },
@@ -24,15 +40,16 @@ export class AuthService {
       },
     });
 
-    if (!user || !user.isActive || user.deletedAt) {
+    // Verify password — always, so every refusal takes the same time.
+    const passwordValid = await bcrypt.compare(
+      dto.password,
+      user?.passwordHash ?? (await AuthService.unknownUserHash),
+    );
+    if (!user || !passwordValid || !user.isActive || user.deletedAt) {
+      if (!passwordValid) this.attempts.recordFailure(dto.username);
       throw new UnauthorizedException('اسم المستخدم أو كلمة المرور غير صحيحة');
     }
-
-    // Verify password
-    const passwordValid = await bcrypt.compare(dto.password, user.passwordHash);
-    if (!passwordValid) {
-      throw new UnauthorizedException('اسم المستخدم أو كلمة المرور غير صحيحة');
-    }
+    this.attempts.recordSuccess(dto.username);
 
     // Update last login
     await this.prisma.user.update({
@@ -96,7 +113,7 @@ export class AuthService {
         where: { id: payload.sub },
       });
 
-      if (!user || !user.isActive) {
+      if (!user || !user.isActive || user.deletedAt) {
         throw new UnauthorizedException('جلسة غير صالحة');
       }
 

@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
 import { APP_GUARD } from '@nestjs/core';
 import { PrismaModule } from './prisma/prisma.module';
+import { ClientIpThrottlerGuard } from './common/client-ip-throttler.guard';
 import { InstructorsModule } from './instructors/instructors.module';
 import { AuthModule } from './auth/auth.module';
 import { StudentsModule } from './students/students.module';
@@ -25,12 +26,13 @@ import { ScheduledNotificationsModule } from './scheduled-notifications/schedule
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    ThrottlerModule.forRoot([
-      {
-        ttl: 60000,
-        limit: 100,
-      },
-    ]),
+    // Per caller (ClientIpThrottlerGuard), not per Railway proxy: 300
+    // requests a minute is far above what one phone does, and still stops
+    // a script. Sign-in has its own, tighter limit (auth.controller.ts).
+    ThrottlerModule.forRoot({
+      throttlers: [{ ttl: 60_000, limit: 300 }],
+      errorMessage: 'طلبات كثيرة خلال وقت قصير. انتظر دقيقة ثم أعد المحاولة.',
+    }),
     // The evening notifications' clock (scheduled-notifications.jobs.ts).
     ScheduleModule.forRoot(),
     PrismaModule,
@@ -55,7 +57,7 @@ import { ScheduledNotificationsModule } from './scheduled-notifications/schedule
   providers: [
     {
       provide: APP_GUARD,
-      useClass: ThrottlerGuard,
+      useClass: ClientIpThrottlerGuard,
     },
   ],
 })

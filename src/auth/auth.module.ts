@@ -5,6 +5,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { LoginAttemptsService } from './login-attempts.service';
 
 import { resolveTtl } from './jwt-ttl.util';
 @Module({
@@ -20,7 +21,7 @@ import { resolveTtl } from './jwt-ttl.util';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy],
+  providers: [AuthService, JwtStrategy, LoginAttemptsService],
   exports: [AuthService, JwtModule],
 })
 export class AuthModule {}

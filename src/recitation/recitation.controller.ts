@@ -21,6 +21,7 @@ import { CreateHadithRecitationDto } from './dto/create-hadith-recitation.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { OwnStudentGuard } from '../auth/guards/own-student.guard';
 
 /**
  * `termId` query parameter, shared by the course-scoped reads below.
@@ -113,6 +114,7 @@ export class RecitationController {
   // Static student route — before any student/:id/... matchers below
   @Get('student/:id/next-suggestion')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT')
+  @UseGuards(OwnStudentGuard)
   async getNextSuggestion(@Param('id') studentId: string) {
     return this.recitationService.getNextSuggestion(studentId);
   }
@@ -121,18 +123,21 @@ export class RecitationController {
   // Nawawi-40 memorization map — cumulative across terms (see service).
   @Get('student/:id/hadith-progress')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
+  @UseGuards(OwnStudentGuard)
   async getStudentHadithProgress(@Param('id') studentId: string) {
     return this.recitationService.getStudentHadithProgress(studentId);
   }
 
   @Get('student/:id/progress')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
+  @UseGuards(OwnStudentGuard)
   async getStudentProgress(@Param('id') studentId: string) {
     return this.recitationService.getStudentProgress(studentId);
   }
 
   @Get('student/:id/history')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
+  @UseGuards(OwnStudentGuard)
   async getStudentRecitations(
     @Param('id') studentId: string,
     @Query('termId') termId?: string,
@@ -144,6 +149,7 @@ export class RecitationController {
 
   @Get('student/:id/homework')
   @Roles('INSTRUCTOR', 'ADMIN', 'STUDENT', 'SUPERVISOR')
+  @UseGuards(OwnStudentGuard)
   async getStudentHomework(@Param('id') studentId: string) {
     return this.recitationService.getStudentHomework(studentId);
   }

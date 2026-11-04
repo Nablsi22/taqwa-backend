@@ -17,6 +17,7 @@ import { AwardPointsDto } from './dto/award-points.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { OwnStudentGuard } from '../auth/guards/own-student.guard';
 import { UpdateCategoryDto } from './dto/update-category.dto';
 
 /**
@@ -101,6 +102,7 @@ export class PointsController {
    */
   @Get('student/:studentId/rank')
   @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT', 'SUPERVISOR')
+  @UseGuards(OwnStudentGuard)
   getStudentRank(
     @Param('studentId', ParseUUIDPipe) studentId: string,
     @Query('termId') termId?: string,
@@ -114,6 +116,7 @@ export class PointsController {
    */
   @Get('student/:studentId')
   @Roles('ADMIN', 'INSTRUCTOR', 'STUDENT', 'SUPERVISOR')
+  @UseGuards(OwnStudentGuard)
   getStudentPoints(
     @Param('studentId', ParseUUIDPipe) studentId: string,
     @Query('page') page?: string,
