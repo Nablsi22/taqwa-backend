@@ -109,3 +109,60 @@ export interface DisciplineRow {
   by_other: boolean;
   marks: number;
 }
+
+/**
+ * Every day of a course on which anything was recorded, with the whole
+ * mosque's counts for that day — the director's daily attendance list.
+ *
+ * Each day is counted exactly as `DAY_ROSTER_SQL` (attendance-stats.sql.ts)
+ * counts one day, so a row here always agrees with the day screen and the
+ * overview: holding pool («عزل») excluded, حلقات of removed أساتذة excluded,
+ * a student is expected from the day he joined, and a student removed since
+ * is kept only on the days he was recorded.
+ *
+ *   $1 course start (date)   $2 last day to read: min(course end, today)
+ *   $3 local time zone       $4 stored time zone
+ */
+export const SESSION_TOTALS_SQL = `
+WITH
+roster AS (
+  SELECT s.id, s.instructor_id, s.deleted_at,
+         ((s.created_at AT TIME ZONE $4::text) AT TIME ZONE $3::text)::date AS joined
+  FROM students s
+  JOIN instructors i ON i.id = s.instructor_id AND NOT i.is_holding_pool
+  JOIN users iu      ON iu.id = i.user_id AND iu.deleted_at IS NULL AND iu.is_active
+),
+days AS (
+  SELECT DISTINCT a.date
+  FROM attendance a
+  JOIN roster r ON r.id = a.student_id AND r.joined <= a.date
+  WHERE a.date BETWEEN $1::date AND $2::date
+)
+SELECT d.date::text                                                          AS day,
+       count(r.id)::int                                                      AS expected,
+       count(DISTINCT r.instructor_id)::int                                  AS halaqas,
+       count(DISTINCT r.instructor_id) FILTER (WHERE a.id IS NOT NULL)::int  AS halaqas_recorded,
+       count(*) FILTER (WHERE a.status = 'PRESENT')::int                     AS present,
+       count(*) FILTER (WHERE a.status = 'LATE')::int                        AS late,
+       count(*) FILTER (WHERE a.status = 'ABSENT' AND NOT a.excused)::int    AS absent,
+       count(*) FILTER (WHERE a.status = 'ABSENT' AND a.excused)::int        AS excused,
+       count(*) FILTER (WHERE a.id IS NULL)::int                             AS unmarked
+FROM days d
+JOIN roster r          ON r.joined <= d.date
+LEFT JOIN attendance a ON a.student_id = r.id AND a.date = d.date
+WHERE r.deleted_at IS NULL OR a.id IS NOT NULL
+GROUP BY d.date
+ORDER BY d.date DESC
+`;
+
+export interface SessionTotalsRow {
+  day: string;
+  expected: number;
+  halaqas: number;
+  halaqas_recorded: number;
+  present: number;
+  late: number;
+  absent: number;
+  excused: number;
+  unmarked: number;
+}

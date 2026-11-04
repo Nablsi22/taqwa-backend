@@ -107,6 +107,13 @@ export class SupervisorController {
     return this.supervisor.day(q.date, q.termId);
   }
 
+  // GET /api/v1/supervisor/sessions?termId=
+  // Every recorded day of the course, newest first, with the day's counts.
+  @Get('sessions')
+  sessions(@Query() q: CourseQueryDto) {
+    return this.supervisor.sessions(q.termId);
+  }
+
   // GET /api/v1/supervisor/students?termId=
   @Get('students')
   students(@Query() q: CourseQueryDto) {

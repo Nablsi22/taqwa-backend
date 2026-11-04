@@ -378,3 +378,66 @@ describe('SupervisorService.day', () => {
     await expect(service.day('17-10-2026')).rejects.toThrow(/غير صالح/);
   });
 });
+
+describe('SupervisorService.sessions', () => {
+  /** A row as SESSION_TOTALS_SQL returns it. */
+  const totals = (
+    day: string,
+    present: number,
+    extra: Partial<Record<string, number>> = {},
+  ) => ({
+    day,
+    expected: 140,
+    halaqas: 10,
+    halaqas_recorded: 9,
+    present,
+    late: 3,
+    absent: 20,
+    excused: 2,
+    unmarked: 14,
+    ...extra,
+  });
+
+  it('reads the whole course, up to the last day measured', async () => {
+    const { service, prisma } = build([]);
+    await service.sessions();
+    const args = prisma.$queryRawUnsafe.mock.calls[0];
+    expect(args[1]).toBe('2026-09-01');
+    expect(args[2]).toBe('2026-10-17');
+    expect(args[3]).toBe('Asia/Damascus');
+    expect(args[4]).toBe('UTC');
+  });
+
+  it('keeps the newest-first order and names each day by the course schedule', async () => {
+    const { service } = build([
+      totals('2026-10-17', 101), // Saturday — required in winter
+      totals('2026-10-15', 12, { absent: 0, excused: 0 }), // Thursday — optional
+      totals('2026-10-14', 9), // Wednesday — a make-up day
+    ]);
+    const res = await service.sessions();
+    expect(res.data.map((d) => [d.date, d.kind])).toEqual([
+      ['2026-10-17', 'REQUIRED'],
+      ['2026-10-15', 'OPTIONAL'],
+      ['2026-10-14', 'EXTRA'],
+    ]);
+    expect(res.data[0]).toEqual({
+      date: '2026-10-17',
+      kind: 'REQUIRED',
+      expected: 140,
+      halaqas: 10,
+      halaqasRecorded: 9,
+      present: 101,
+      late: 3,
+      absent: 20,
+      excused: 2,
+      unmarked: 14,
+    });
+    expect(res.course.meetingDays.required).toEqual([6]);
+    expect(res.today).toBe('2026-10-21');
+  });
+
+  it('returns an empty list for a course with nothing recorded yet', async () => {
+    const { service } = build([]);
+    await expect(service.sessions()).resolves.toMatchObject({ data: [] });
+  });
+});

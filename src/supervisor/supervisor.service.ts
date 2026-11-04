@@ -5,8 +5,18 @@ import {
   CourseContext,
 } from '../attendance-stats/attendance-stats.service';
 import { ATTENDANCE_RULES } from '../attendance-stats/attendance-stats.rules';
-import { addDays, isCalendarDay } from '../attendance-stats/meeting-days';
-import { DisciplineRow, RECORDING_DISCIPLINE_SQL } from './supervisor.sql';
+import {
+  DayKind,
+  addDays,
+  dayKindOf,
+  isCalendarDay,
+} from '../attendance-stats/meeting-days';
+import {
+  DisciplineRow,
+  RECORDING_DISCIPLINE_SQL,
+  SESSION_TOTALS_SQL,
+  SessionTotalsRow,
+} from './supervisor.sql';
 import { ScheduledDay, lastRequiredDays, scheduledDays } from './meeting-calendar';
 
 /** How a حلقة's single meeting day went, from the director's side. */
@@ -27,6 +37,24 @@ export interface SessionRecord {
    * case the director should hold the أستاذ to.
    */
   missed: boolean;
+}
+
+/** One recorded day of the course, counted across every حلقة. */
+export interface SessionTotals {
+  date: string;
+  kind: DayKind;
+  /** Students expected that day (holding pool excluded). */
+  expected: number;
+  halaqas: number;
+  /** حلقات with at least one student recorded that day. */
+  halaqasRecorded: number;
+  present: number;
+  late: number;
+  /** Unexcused. */
+  absent: number;
+  excused: number;
+  /** Expected that day, nothing recorded for them. */
+  unmarked: number;
 }
 
 export interface InstructorDiscipline {
@@ -310,6 +338,50 @@ export class SupervisorService {
       date: day,
       kind: session.kind,
       halaqas,
+    };
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Every recorded day of the course, newest first — the daily list
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * One row per day on which anything was recorded, with the whole mosque's
+   * counts. Days nobody recorded (a holiday) are not listed: the list is a
+   * record of sessions held, and the day screen still shows any meeting day
+   * on request. On an optional day nobody is counted absent by the rules,
+   * so the app shows only who came — `absent` stays as recorded.
+   */
+  async sessions(termId?: number): Promise<{
+    course: CourseContext['term'] & {
+      meetingDays: CourseContext['meetingDays'];
+    };
+    today: string;
+    data: SessionTotals[];
+  }> {
+    const ctx = await this.courseContext(termId);
+    const rows = await this.prisma.$queryRawUnsafe<SessionTotalsRow[]>(
+      SESSION_TOTALS_SQL,
+      ctx.term.startDate,
+      ctx.measuredUntil,
+      ATTENDANCE_RULES.localTimeZone,
+      ATTENDANCE_RULES.storedTimeZone,
+    );
+    return {
+      course: { ...ctx.term, meetingDays: ctx.meetingDays },
+      today: ctx.today,
+      data: rows.map((r) => ({
+        date: r.day,
+        kind: dayKindOf(r.day, ctx.meetingDays),
+        expected: r.expected,
+        halaqas: r.halaqas,
+        halaqasRecorded: r.halaqas_recorded,
+        present: r.present,
+        late: r.late,
+        absent: r.absent,
+        excused: r.excused,
+        unmarked: r.unmarked,
+      })),
     };
   }
 
