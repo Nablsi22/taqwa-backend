@@ -1,0 +1,5 @@
+Firebase JavaScript SDK 12.9.0 — https://github.com/firebase/firebase-js-sdk
+Copyright Google LLC. Licensed under the Apache-2.0 licence:
+https://www.apache.org/licenses/LICENSE-2.0
+Source tarball: https://registry.npmjs.org/firebase/-/firebase-12.9.0.tgz
+firebase-messaging.js: its import of firebase-app.js was changed to a local path.

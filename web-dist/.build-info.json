@@ -1,0 +1,11 @@
+{
+    "appVersion":  "1.0.19+21",
+    "gitCommit":  "a831bc2",
+    "gitDirty":  true,
+    "builtAt":  "2026-11-05T20:03:45.8350224Z",
+    "flutter":  "3.47.0",
+    "firebaseJsSdk":  "12.9.0",
+    "files":  54,
+    "bytes":  46529545,
+    "mainDartJsSha256":  "c580c79511691fc8366385ebff3e434393b26778e211ae65df423e45e229450f"
+}

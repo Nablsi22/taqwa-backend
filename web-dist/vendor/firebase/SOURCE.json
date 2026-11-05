@@ -1,0 +1,18 @@
+{
+  "package": "firebase",
+  "version": "12.9.0",
+  "license": "Apache-2.0",
+  "tarball": "https://registry.npmjs.org/firebase/-/firebase-12.9.0.tgz",
+  "integrity": "sha512-CwwTYoqZg6KxygPOaaJqIc4aoLvo0RCRrXoln9GoxLE8QyAwTydBaSLGVlR4WPcuOgN3OEL0tJLT1H4IU/dv7w==",
+  "rewritten": {
+    "firebase-messaging.js": "https://www.gstatic.com/firebasejs/12.9.0/firebase-app.js → ./firebase-app.js"
+  },
+  "sha256": {
+    "firebase-app-compat.js": "7d33eb276e46a150144fcc1d1eb5966d218fcbfca2d61087e113cd73ddf2d4df",
+    "firebase-app.js": "9d1506ac46c736e133afa49ceba8dff794c13898388cd91bbd1b8d2463f18315",
+    "firebase-messaging-compat.js": "c914d60dc1bb835a61e3e8cecbcceda8787cece06fbc60591233913db08f162a",
+    "firebase-messaging.js": "97f207ce4e0a4b2fc0b2a3fe0e35a17c645ee588a1b5616734b27d0156b155b9",
+    "LICENSE.txt": "d409fa7238e790b8224e69255272e7f85145c8a746f7b2026ede303ae172bc12"
+  },
+  "fetchedAt": "2026-11-05T12:18:39.688Z"
+}

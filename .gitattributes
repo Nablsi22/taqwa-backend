@@ -1,0 +1,3 @@
+# Flutter web build output (tool\build_web.ps1): stored and deployed byte for byte.
+# No end-of-line conversion and no text diffs on minified files.
+web-dist/** binary

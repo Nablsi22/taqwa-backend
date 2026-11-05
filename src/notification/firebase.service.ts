@@ -3,6 +3,22 @@ import * as admin from 'firebase-admin';
 import * as fs from 'fs';
 import * as path from 'path';
 
+/**
+ * Browser (web app) delivery. Arabic, right-to-left, with the app icon;
+ * a reminder older than three days is no longer worth showing, so the push
+ * service may drop it (TTL, in seconds). The click is handled by
+ * web/firebase-messaging-sw.js, which opens or focuses the app.
+ * Ref: https://firebase.google.com/docs/reference/admin/node/firebase-admin.messaging.webpushconfig
+ */
+const WEB_PUSH: admin.messaging.WebpushConfig = {
+  headers: { TTL: '259200', Urgency: 'high' },
+  notification: {
+    dir: 'rtl',
+    lang: 'ar',
+    icon: '/icons/Icon-192.png',
+  },
+};
+
 @Injectable()
 export class FirebaseService implements OnModuleInit {
   private readonly logger = new Logger(FirebaseService.name);
@@ -120,6 +136,7 @@ export class FirebaseService implements OnModuleInit {
             },
           },
         },
+        webpush: WEB_PUSH,
       };
 
       await admin.messaging().send(message);
@@ -173,6 +190,7 @@ export class FirebaseService implements OnModuleInit {
             },
           },
         },
+        webpush: WEB_PUSH,
       };
 
       const response = await admin.messaging().sendEachForMulticast(message);

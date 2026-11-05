@@ -22,6 +22,7 @@ import { AttendanceStatsModule } from './attendance-stats/attendance-stats.modul
 import { SubstituteModule } from './substitute/substitute.module';
 import { SupervisorModule } from './supervisor/supervisor.module';
 import { ScheduledNotificationsModule } from './scheduled-notifications/scheduled-notifications.module';
+import { QuranPagesModule } from './quran-pages/quran-pages.module';
 
 @Module({
   imports: [
@@ -53,6 +54,8 @@ import { ScheduledNotificationsModule } from './scheduled-notifications/schedule
     SubstituteModule,
     SupervisorModule,
     ScheduledNotificationsModule,
+    // Mushaf page images for the web app (same origin; see the module).
+    QuranPagesModule,
   ],
   providers: [
     {
